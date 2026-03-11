@@ -1,0 +1,1456 @@
+"""Tests for the Neo4j graph client."""
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from telescope.config import Config
+from telescope.models import (
+    CallGraphNode,
+    ClassHierarchy,
+    CodebaseOverview,
+    CodeEntity,
+    FileContext,
+    FunctionContext,
+    ImpactResult,
+)
+
+
+@pytest.fixture()
+def test_config():
+    return Config(
+        neo4j_uri="bolt://localhost:7687",
+        neo4j_user="neo4j",
+        neo4j_password="constellation",
+        openai_api_key="sk-test-key",
+    )
+
+
+@pytest.fixture()
+def patched_config(test_config):
+    """Patch get_config in graph_client to return test_config."""
+    with patch("telescope.graph_client.get_config", return_value=test_config):
+        yield test_config
+
+
+class TestGraphClientConnect:
+    """Tests for GraphClient.connect()."""
+
+    async def test_connect_creates_driver(self, patched_config):
+        """Verify AsyncGraphDatabase.driver is called with correct URI and auth."""
+        with patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.graph_client.AsyncOpenAI"):
+            mock_driver = AsyncMock()
+            mock_driver.verify_connectivity = AsyncMock()
+            mock_gdb.driver = MagicMock(return_value=mock_driver)
+            from telescope.graph_client import GraphClient
+            client = GraphClient()
+            await client.connect()
+            mock_gdb.driver.assert_called_once_with(
+                "bolt://localhost:7687",
+                auth=("neo4j", "constellation"),
+            )
+
+    async def test_connect_verifies_connectivity(self, patched_config, mock_neo4j_driver):
+        """Startup should fail fast if Neo4j connectivity is broken."""
+        with patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.graph_client.AsyncOpenAI"):
+            mock_gdb.driver = MagicMock(return_value=mock_neo4j_driver)
+            from telescope.graph_client import GraphClient
+            client = GraphClient()
+            await client.connect()
+            mock_neo4j_driver.verify_connectivity.assert_awaited_once()
+
+    async def test_connect_creates_openai_client(self, patched_config):
+        """Verify AsyncOpenAI is called with api_key."""
+        with patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.graph_client.AsyncOpenAI") as mock_openai:
+            mock_driver = AsyncMock()
+            mock_driver.verify_connectivity = AsyncMock()
+            mock_gdb.driver = MagicMock(return_value=mock_driver)
+            from telescope.graph_client import GraphClient
+            client = GraphClient()
+            await client.connect()
+            call_kwargs = mock_openai.call_args[1]
+            assert call_kwargs["api_key"] == "sk-test-key"
+
+    async def test_connect_passes_base_url_when_set(self, test_config):
+        """When openai_base_url is set, AsyncOpenAI is called with base_url."""
+        test_config.openai_base_url = "https://my-custom-openai.example.com"
+        with patch("telescope.graph_client.get_config", return_value=test_config), \
+             patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.graph_client.AsyncOpenAI") as mock_openai:
+            mock_driver = AsyncMock()
+            mock_driver.verify_connectivity = AsyncMock()
+            mock_gdb.driver = MagicMock(return_value=mock_driver)
+            from telescope.graph_client import GraphClient
+            client = GraphClient()
+            await client.connect()
+            call_kwargs = mock_openai.call_args[1]
+            assert call_kwargs.get("base_url") == "https://my-custom-openai.example.com"
+
+    async def test_connect_omits_base_url_when_none(self, patched_config):
+        """When openai_base_url is None, AsyncOpenAI is NOT called with base_url."""
+        assert patched_config.openai_base_url is None
+        with patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.graph_client.AsyncOpenAI") as mock_openai:
+            mock_driver = AsyncMock()
+            mock_driver.verify_connectivity = AsyncMock()
+            mock_gdb.driver = MagicMock(return_value=mock_driver)
+            from telescope.graph_client import GraphClient
+            client = GraphClient()
+            await client.connect()
+            call_kwargs = mock_openai.call_args[1]
+            assert "base_url" not in call_kwargs
+
+
+class TestGraphClientClose:
+    """Tests for GraphClient.close()."""
+
+    async def test_close_calls_driver_close(self, patched_config, mock_neo4j_driver):
+        """Verify driver.close() is called when driver exists."""
+        from telescope.graph_client import GraphClient
+        client = GraphClient()
+        client._driver = mock_neo4j_driver
+        await client.close()
+        mock_neo4j_driver.close.assert_called_once()
+
+    async def test_close_calls_openai_close(self, patched_config, mock_openai_client):
+        """Verify the OpenAI client is closed when present."""
+        from telescope.graph_client import GraphClient
+        client = GraphClient()
+        client._openai = mock_openai_client
+        await client.close()
+        mock_openai_client.close.assert_awaited_once()
+
+    async def test_close_safe_when_not_connected(self, patched_config):
+        """No error when _driver is None (never connected)."""
+        from telescope.graph_client import GraphClient
+        client = GraphClient()
+        assert client._driver is None
+        # Should not raise
+        await client.close()
+
+
+class TestGraphClientQuery:
+    """Tests for GraphClient._query()."""
+
+    async def test_query_runs_cypher_and_returns_dicts(
+        self, patched_config, mock_neo4j_driver, mock_neo4j_result
+    ):
+        """Verify _query executes the cypher and returns list of dicts."""
+        expected_data = [{"name": "foo"}, {"name": "bar"}]
+        mock_neo4j_driver.session.return_value.run = AsyncMock(
+            return_value=mock_neo4j_result(expected_data)
+        )
+        from telescope.graph_client import GraphClient
+        client = GraphClient()
+        client._driver = mock_neo4j_driver
+        result = await client._query("MATCH (n) RETURN n")
+        assert result == expected_data
+
+    async def test_query_reads_full_result_set(
+        self, patched_config, mock_neo4j_driver, mock_neo4j_result
+    ):
+        """_query should consume all rows, not just an arbitrary page."""
+        mock_session = mock_neo4j_driver.session.return_value
+        mock_result = mock_neo4j_result([{"name": "foo"}])
+        mock_session.run = AsyncMock(return_value=mock_result)
+        from telescope.graph_client import GraphClient
+        client = GraphClient()
+        client._driver = mock_neo4j_driver
+        await client._query("MATCH (n) RETURN n")
+        mock_result.data.assert_awaited_once()
+        mock_result.fetch.assert_not_called()
+
+    async def test_query_passes_parameters(
+        self, patched_config, mock_neo4j_driver, mock_neo4j_result
+    ):
+        """Verify params are passed to session.run()."""
+        mock_session = mock_neo4j_driver.session.return_value
+        mock_session.run = AsyncMock(return_value=mock_neo4j_result([]))
+        from telescope.graph_client import GraphClient
+        client = GraphClient()
+        client._driver = mock_neo4j_driver
+        await client._query("MATCH (n {name: $name}) RETURN n", name="MyClass")
+        mock_session.run.assert_called_once_with(
+            "MATCH (n {name: $name}) RETURN n", name="MyClass"
+        )
+
+
+class TestGraphClientGetEmbedding:
+    """Tests for GraphClient._get_embedding()."""
+
+    async def test_get_embedding_calls_openai(
+        self, patched_config, mock_openai_client
+    ):
+        """Verify embeddings.create() is called with correct model, input, dimensions."""
+        from telescope.graph_client import GraphClient
+        client = GraphClient()
+        client._openai = mock_openai_client
+        await client._get_embedding("search query text")
+        mock_openai_client.embeddings.create.assert_called_once_with(
+            model=patched_config.embedding_model,
+            input="search query text",
+            dimensions=patched_config.embedding_dimensions,
+        )
+
+    async def test_get_embedding_returns_vector(
+        self, patched_config, mock_openai_client, mock_openai_response
+    ):
+        """Verify _get_embedding returns the embedding list from the response."""
+        expected_vector = [0.5] * 1536
+        mock_openai_client.embeddings.create = AsyncMock(
+            return_value=mock_openai_response(embedding=expected_vector)
+        )
+        from telescope.graph_client import GraphClient
+        client = GraphClient()
+        client._openai = mock_openai_client
+        result = await client._get_embedding("some text")
+        assert result == expected_vector
+
+
+def _make_search_result(
+    name="foo",
+    file_path="src/Foo.java",
+    repository="my-repo",
+    line_number=10,
+    line_end=20,
+    code="def foo():\n    pass",
+    signature="def foo()",
+    entity_type="method",
+    score=0.95,
+):
+    """Helper to build a mock Neo4j result dict for search_code."""
+    return {
+        "name": name,
+        "file_path": file_path,
+        "repository": repository,
+        "line_number": line_number,
+        "line_end": line_end,
+        "code": code,
+        "signature": signature,
+        "entity_type": entity_type,
+        "score": score,
+    }
+
+
+@pytest.fixture()
+def graph_client(test_config):
+    """Create a GraphClient with mocked internals for search_code tests."""
+    with patch("telescope.graph_client.get_config", return_value=test_config):
+        from telescope.graph_client import GraphClient
+        client = GraphClient()
+    client._driver = AsyncMock()
+    client._openai = AsyncMock()
+    return client
+
+
+class TestSearchCode:
+    """Tests for GraphClient.search_code()."""
+
+    async def test_search_code_calls_get_embedding(self, graph_client):
+        """Verify _get_embedding called with query text."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.search_code("auth logic")
+        graph_client._get_embedding.assert_called_once_with("auth logic")
+
+    async def test_search_code_queries_all_indexes_when_no_entity_type(self, graph_client):
+        """When entity_type=None, verify _query called 4 times (once per index)."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.search_code("auth logic")
+        assert graph_client._query.call_count == 4
+
+    async def test_search_code_queries_single_index_for_entity_type(self, graph_client):
+        """When entity_type='method', verify _query called once with vector_method_embedding."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.search_code("auth logic", entity_type="method")
+        assert graph_client._query.call_count == 1
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "vector_method_embedding" in cypher_arg
+
+    async def test_search_code_queries_constructor_index(self, graph_client):
+        """When entity_type='constructor', verify _query called with vector_constructor_embedding."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.search_code("init", entity_type="constructor")
+        assert graph_client._query.call_count == 1
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "vector_constructor_embedding" in cypher_arg
+
+    async def test_search_code_applies_repository_filter(self, graph_client):
+        """Verify Cypher contains n.repository = $repository."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.search_code("auth", entity_type="method", repository="my-repo")
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "n.repository = $repository" in cypher_arg
+
+    async def test_search_code_applies_file_pattern_filter(self, graph_client):
+        """Verify wildcard file filters are parameterized as regex."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.search_code("auth", entity_type="method", file_pattern="Service.java")
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "n.file_path =~ $file_regex" in cypher_arg
+        assert graph_client._query.call_args.kwargs["file_regex"] == "^.*Service\\.java.*$"
+
+    async def test_search_code_maps_line_number_to_line_start(self, graph_client):
+        """Verify line_number from Neo4j result maps to line_start on CodeEntity."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        mock_result = _make_search_result(line_number=42, line_end=50)
+        graph_client._query = AsyncMock(return_value=[mock_result])
+        results = await graph_client.search_code("auth", entity_type="method")
+        assert len(results) == 1
+        assert results[0].line_start == 42
+        assert results[0].line_end == 50
+
+    async def test_search_code_code_mode_none(self, graph_client):
+        """Verify code=None when code_mode='none'."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        mock_result = _make_search_result(code="def foo():\n    pass", signature="def foo()")
+        graph_client._query = AsyncMock(return_value=[mock_result])
+        results = await graph_client.search_code("auth", entity_type="method", code_mode="none")
+        assert results[0].code is None
+
+    async def test_search_code_code_mode_signature(self, graph_client):
+        """Verify code=signature when code_mode='signature'."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        mock_result = _make_search_result(code="def foo():\n    pass", signature="def foo()")
+        graph_client._query = AsyncMock(return_value=[mock_result])
+        results = await graph_client.search_code("auth", entity_type="method", code_mode="signature")
+        assert results[0].code == "def foo()"
+
+    async def test_search_code_code_mode_preview_truncates(self, graph_client):
+        """Verify long code truncated to 10 lines with '... (truncated)'."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        long_code = "\n".join([f"line {i}" for i in range(20)])
+        mock_result = _make_search_result(code=long_code, signature="def foo()")
+        graph_client._query = AsyncMock(return_value=[mock_result])
+        results = await graph_client.search_code("auth", entity_type="method", code_mode="preview")
+        code = results[0].code
+        lines = code.split("\n")
+        assert len(lines) == 11  # 10 lines + "... (truncated)"
+        assert lines[-1] == "... (truncated)"
+        assert lines[0] == "line 0"
+        assert lines[9] == "line 9"
+
+    async def test_search_code_code_mode_full(self, graph_client):
+        """Verify full code returned when code_mode='full'."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        long_code = "\n".join([f"line {i}" for i in range(20)])
+        mock_result = _make_search_result(code=long_code, signature="def foo()")
+        graph_client._query = AsyncMock(return_value=[mock_result])
+        results = await graph_client.search_code("auth", entity_type="method", code_mode="full")
+        assert results[0].code == long_code
+
+    async def test_search_code_results_sorted_by_score(self, graph_client):
+        """Verify results sorted descending by score."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        results_batch1 = [
+            _make_search_result(name="low", score=0.5),
+            _make_search_result(name="high", score=0.99),
+        ]
+        results_batch2 = [
+            _make_search_result(name="mid", score=0.75),
+        ]
+        graph_client._query = AsyncMock(side_effect=[
+            results_batch1, results_batch2, [], [],
+        ])
+        results = await graph_client.search_code("auth")
+        scores = [r.score for r in results]
+        assert scores == sorted(scores, reverse=True)
+        assert results[0].name == "high"
+        assert results[1].name == "mid"
+        assert results[2].name == "low"
+
+    async def test_search_code_results_limited(self, graph_client):
+        """Verify results capped at limit."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        many_results = [_make_search_result(name=f"r{i}", score=1.0 - i * 0.01) for i in range(10)]
+        graph_client._query = AsyncMock(side_effect=[
+            many_results, many_results, many_results, many_results,
+        ])
+        results = await graph_client.search_code("auth", limit=5)
+        assert len(results) == 5
+
+
+class TestGetCallers:
+    """Tests for GraphClient.get_callers()."""
+
+    async def test_get_callers_basic(self, graph_client):
+        """Returns list of CallGraphNode from mock results."""
+        graph_client._query = AsyncMock(return_value=[
+            {"name": "caller1", "file_path": "src/main.py", "repository": "my-repo", "signature": "def caller1()", "line_number": 10},
+            {"name": "caller2", "file_path": "src/utils.py", "repository": "my-repo", "signature": "def caller2()", "line_number": 20},
+        ])
+        results = await graph_client.get_callers("targetMethod")
+        assert len(results) == 2
+        assert all(isinstance(r, CallGraphNode) for r in results)
+        assert results[0].name == "caller1"
+        assert results[0].file_path == "src/main.py"
+        assert results[0].repository == "my-repo"
+        assert results[0].signature == "def caller1()"
+        assert results[1].name == "caller2"
+
+    async def test_get_callers_matches_method_or_constructor(self, graph_client):
+        """Verify Cypher contains (m:Method OR m:Constructor)."""
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.get_callers("someMethod")
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "(m:Method OR m:Constructor)" in cypher_arg
+
+    async def test_get_callers_traverses_overrides(self, graph_client):
+        """Verify caller traversal uses actual Constellation type relationships."""
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.get_callers("someMethod")
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "IMPLEMENTS" in cypher_arg
+        assert "EXTENDS" in cypher_arg
+        assert "OVERRIDES" not in cypher_arg
+
+    async def test_get_callers_preserves_top_level_functions(self, graph_client):
+        """Top-level functions should stay queryable even without a class owner."""
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.get_callers("standalone_function")
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "WHEN owner IS NULL THEN [NULL]" in cypher_arg
+
+    async def test_get_callers_depth_clamped_to_3(self, graph_client):
+        """Passing depth=5 results in CALLS*1..3 in Cypher."""
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.get_callers("someMethod", depth=5)
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "CALLS*1..3" in cypher_arg
+
+    async def test_get_callers_applies_file_filter(self, graph_client):
+        """Verify file_path is passed as a parameterized suffix filter."""
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.get_callers("someMethod", file_path="Service.java")
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "ENDS WITH" in cypher_arg
+        assert graph_client._query.call_args.kwargs["file_path"] == "Service.java"
+
+    async def test_get_callers_applies_repo_filter(self, graph_client):
+        """Verify Cypher contains repository = $repository when repository provided."""
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.get_callers("someMethod", repository="my-repo")
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "repository = $repository" in cypher_arg
+
+    async def test_get_callers_maps_line_number_to_line_start(self, graph_client):
+        """Verify line_number from Neo4j result maps to line_start on CallGraphNode."""
+        graph_client._query = AsyncMock(return_value=[
+            {"name": "caller1", "file_path": "src/main.py", "repository": "my-repo", "signature": "def caller1()", "line_number": 42},
+        ])
+        results = await graph_client.get_callers("targetMethod")
+        assert len(results) == 1
+        assert results[0].line_start == 42
+
+    async def test_get_callers_empty_results(self, graph_client):
+        """Returns empty list when no callers found."""
+        graph_client._query = AsyncMock(return_value=[])
+        results = await graph_client.get_callers("unusedMethod")
+        assert results == []
+
+
+class TestGetCallees:
+    """Tests for GraphClient.get_callees()."""
+
+    async def test_get_callees_basic(self, graph_client):
+        """Returns list of CallGraphNode from mock results."""
+        graph_client._query = AsyncMock(side_effect=[
+            [
+                {
+                    "name": "callee1",
+                    "file_path": "src/service.py",
+                    "repository": "my-repo",
+                    "signature": "def callee1()",
+                    "line_number": 15,
+                    "entity_type": "Method",
+                    "relationship_type": "CALLS",
+                    "depth": 1,
+                },
+                {
+                    "name": "requests.get",
+                    "file_path": "src/dao.py",
+                    "repository": "my-repo",
+                    "line_number": 30,
+                    "entity_type": "Reference",
+                    "relationship_type": "CALLS",
+                    "depth": 1,
+                },
+            ],
+            [],
+        ])
+        results = await graph_client.get_callees("sourceMethod")
+        assert len(results) == 2
+        assert all(isinstance(r, CallGraphNode) for r in results)
+        by_name = {result.name: result for result in results}
+        assert by_name["callee1"].file_path == "src/service.py"
+        assert by_name["callee1"].repository == "my-repo"
+        assert by_name["callee1"].signature == "def callee1()"
+        assert by_name["callee1"].entity_type == "method"
+        assert by_name["requests.get"].entity_type == "reference"
+        assert by_name["requests.get"].relationship_type == "CALLS"
+
+    async def test_get_callees_matches_method_or_constructor(self, graph_client):
+        """Verify Cypher contains (m:Method OR m:Constructor)."""
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.get_callees("someMethod")
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "(m:Method OR m:Constructor)" in cypher_arg
+
+    async def test_get_callees_traverses_overrides(self, graph_client):
+        """Verify callee traversal uses actual Constellation type relationships."""
+        graph_client._query = AsyncMock(side_effect=[[], []])
+        await graph_client.get_callees("someMethod")
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "IMPLEMENTS" in cypher_arg
+        assert "EXTENDS" in cypher_arg
+        assert "OVERRIDES" not in cypher_arg
+
+    async def test_get_callees_depth_clamped_to_3(self, graph_client):
+        """Passing depth=10 results in CALLS*1..3 in Cypher."""
+        graph_client._query = AsyncMock(side_effect=[[], []])
+        await graph_client.get_callees("someMethod", depth=10)
+        cypher_arg = graph_client._query.call_args_list[0][0][0]
+        assert "CALLS*1..3" in cypher_arg
+
+    async def test_get_callees_maps_line_number_to_line_start(self, graph_client):
+        """Verify line_number from Neo4j result maps to line_start on CallGraphNode."""
+        graph_client._query = AsyncMock(side_effect=[
+            [
+                {
+                    "name": "callee1",
+                    "file_path": "src/service.py",
+                    "repository": "my-repo",
+                    "signature": "def callee1()",
+                    "line_number": 55,
+                    "entity_type": "Method",
+                    "relationship_type": "CALLS",
+                    "depth": 1,
+                },
+            ],
+            [],
+        ])
+        results = await graph_client.get_callees("sourceMethod")
+        assert len(results) == 1
+        assert results[0].line_start == 55
+
+    async def test_get_callees_empty_results(self, graph_client):
+        """Returns empty list when no callees found."""
+        graph_client._query = AsyncMock(side_effect=[[], []])
+        results = await graph_client.get_callees("leafMethod")
+        assert results == []
+
+    async def test_get_callees_includes_hook_targets(self, graph_client):
+        """Hook usage should be surfaced alongside call targets."""
+        graph_client._query = AsyncMock(side_effect=[
+            [],
+            [
+                {
+                    "name": "useState",
+                    "file_path": "src/App.tsx",
+                    "repository": "my-repo",
+                    "line_number": 10,
+                    "entity_type": "Hook",
+                    "relationship_type": "USES_HOOK",
+                    "depth": 1,
+                },
+            ],
+        ])
+        results = await graph_client.get_callees("render")
+        assert len(results) == 1
+        assert results[0].name == "useState"
+        assert results[0].entity_type == "hook"
+        assert results[0].relationship_type == "USES_HOOK"
+
+
+def _make_function_context_result(
+    name="getData",
+    id="my-repo::com.example.Service.getData",
+    file_path="src/Service.java",
+    repository="my-repo",
+    code="public String getData() { ... }",
+    signature="public String getData()",
+    docstring="Gets data",
+    class_name="Service",
+):
+    """Helper to build a mock Neo4j result dict for get_function_context."""
+    return {
+        "name": name,
+        "id": id,
+        "file_path": file_path,
+        "repository": repository,
+        "code": code,
+        "signature": signature,
+        "docstring": docstring,
+        "class_name": class_name,
+    }
+
+
+class TestGetFunctionContext:
+    """Tests for GraphClient.get_function_context()."""
+
+    async def test_get_function_context_returns_context(self, graph_client):
+        """Basic return with all fields populated."""
+        graph_client._query = AsyncMock(return_value=[_make_function_context_result()])
+        graph_client.get_callers = AsyncMock(return_value=[])
+        graph_client.get_callees = AsyncMock(return_value=[])
+
+        result = await graph_client.get_function_context("getData")
+
+        assert isinstance(result, FunctionContext)
+        assert result.name == "getData"
+        assert result.file_path == "src/Service.java"
+        assert result.repository == "my-repo"
+        assert result.code == "public String getData() { ... }"
+        assert result.signature == "public String getData()"
+        assert result.docstring == "Gets data"
+        assert result.class_name == "Service"
+
+    async def test_get_function_context_derives_full_name_from_id(self, graph_client):
+        """When id='my-repo::com.example.Service.getData', full_name should be 'com.example.Service.getData'."""
+        graph_client._query = AsyncMock(return_value=[
+            _make_function_context_result(id="my-repo::com.example.Service.getData"),
+        ])
+        graph_client.get_callers = AsyncMock(return_value=[])
+        graph_client.get_callees = AsyncMock(return_value=[])
+
+        result = await graph_client.get_function_context("getData")
+
+        assert result.full_name == "com.example.Service.getData"
+
+    async def test_get_function_context_full_name_fallback(self, graph_client):
+        """When id has no '::', falls back to name."""
+        graph_client._query = AsyncMock(return_value=[
+            _make_function_context_result(id="getData", name="getData"),
+        ])
+        graph_client.get_callers = AsyncMock(return_value=[])
+        graph_client.get_callees = AsyncMock(return_value=[])
+
+        result = await graph_client.get_function_context("getData")
+
+        assert result.full_name == "getData"
+
+    async def test_get_function_context_includes_callers_and_callees(self, graph_client):
+        """Verify get_callers and get_callees are called, and results included."""
+        graph_client._query = AsyncMock(return_value=[_make_function_context_result()])
+        mock_callers = [
+            CallGraphNode(name="caller1", file_path="src/main.py", signature="def caller1()"),
+        ]
+        mock_callees = [
+            CallGraphNode(name="callee1", file_path="src/dao.py", signature="def callee1()"),
+        ]
+        graph_client.get_callers = AsyncMock(return_value=mock_callers)
+        graph_client.get_callees = AsyncMock(return_value=mock_callees)
+
+        result = await graph_client.get_function_context("getData")
+
+        graph_client.get_callers.assert_called_once_with(
+            "getData",
+            repository=None,
+            file_path=None,
+            depth=1,
+            entity_id="my-repo::com.example.Service.getData",
+        )
+        graph_client.get_callees.assert_called_once_with(
+            "getData",
+            repository=None,
+            file_path=None,
+            depth=1,
+            entity_id="my-repo::com.example.Service.getData",
+        )
+        assert result.callers == mock_callers
+        assert result.callees == mock_callees
+
+    async def test_get_function_context_returns_none_when_not_found(self, graph_client):
+        """_query returns [], method returns None."""
+        graph_client._query = AsyncMock(return_value=[])
+
+        result = await graph_client.get_function_context("nonExistent")
+
+        assert result is None
+
+    async def test_get_function_context_matches_constructor(self, graph_client):
+        """Verify Cypher contains (m:Method OR m:Constructor)."""
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.get_function_context("MyConstructor")
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "(m:Method OR m:Constructor)" in cypher_arg
+
+    async def test_get_function_context_with_filters(self, graph_client):
+        """Verify file_path and repository filters work."""
+        graph_client._query = AsyncMock(return_value=[_make_function_context_result()])
+        graph_client.get_callers = AsyncMock(return_value=[])
+        graph_client.get_callees = AsyncMock(return_value=[])
+
+        await graph_client.get_function_context(
+            "getData", repository="my-repo", file_path="Service.java"
+        )
+
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "ENDS WITH" in cypher_arg
+        assert graph_client._query.call_args.kwargs["file_path"] == "Service.java"
+        assert "repository = $repository" in cypher_arg
+        # Verify callers/callees also receive the filters
+        graph_client.get_callers.assert_called_once_with(
+            "getData",
+            repository="my-repo",
+            file_path="Service.java",
+            depth=1,
+            entity_id="my-repo::com.example.Service.getData",
+        )
+        graph_client.get_callees.assert_called_once_with(
+            "getData",
+            repository="my-repo",
+            file_path="Service.java",
+            depth=1,
+            entity_id="my-repo::com.example.Service.getData",
+        )
+
+
+def _make_class_hierarchy_result(
+    name="UserService",
+    id="my-repo::com.example.UserService",
+    file_path="src/UserService.java",
+    repository="my-repo",
+    labels=None,
+    parents=None,
+    children=None,
+    interfaces=None,
+    implementors=None,
+    methods=None,
+    fields=None,
+    constructors=None,
+):
+    """Helper to build a mock Neo4j result dict for get_class_hierarchy."""
+    return {
+        "name": name,
+        "id": id,
+        "file_path": file_path,
+        "repository": repository,
+        "labels": labels if labels is not None else ["Class"],
+        "parents": parents if parents is not None else ["BaseService"],
+        "children": children if children is not None else ["AdminService"],
+        "interfaces": interfaces if interfaces is not None else ["IUserService"],
+        "implementors": implementors if implementors is not None else [],
+        "methods": methods if methods is not None else ["getUser", "updateUser"],
+        "fields": fields if fields is not None else ["name", "email"],
+        "constructors": constructors if constructors is not None else ["UserService"],
+    }
+
+
+class TestGetClassHierarchy:
+    """Tests for GraphClient.get_class_hierarchy()."""
+
+    async def test_get_class_hierarchy_returns_hierarchy(self, graph_client):
+        """Basic return with all fields populated."""
+        graph_client._query = AsyncMock(return_value=[_make_class_hierarchy_result()])
+
+        result = await graph_client.get_class_hierarchy("UserService")
+
+        assert isinstance(result, ClassHierarchy)
+        assert result.name == "UserService"
+        assert result.full_name == "com.example.UserService"
+        assert result.file_path == "src/UserService.java"
+        assert result.repository == "my-repo"
+        assert result.is_interface is False
+        assert result.parents == ["BaseService"]
+        assert result.children == ["AdminService"]
+        assert result.interfaces == ["IUserService"]
+        assert result.implementors == []
+        assert result.methods == ["getUser", "updateUser"]
+        assert result.fields == ["name", "email"]
+        assert result.constructors == ["UserService"]
+
+    async def test_get_class_hierarchy_detects_interface_from_labels(self, graph_client):
+        """When labels=['Interface'], is_interface=True."""
+        graph_client._query = AsyncMock(return_value=[
+            _make_class_hierarchy_result(labels=["Interface"]),
+        ])
+
+        result = await graph_client.get_class_hierarchy("IUserService")
+
+        assert result.is_interface is True
+
+    async def test_get_class_hierarchy_class_not_interface(self, graph_client):
+        """When labels=['Class'], is_interface=False."""
+        graph_client._query = AsyncMock(return_value=[
+            _make_class_hierarchy_result(labels=["Class"]),
+        ])
+
+        result = await graph_client.get_class_hierarchy("UserService")
+
+        assert result.is_interface is False
+
+    async def test_get_class_hierarchy_includes_constructors(self, graph_client):
+        """Verify constructors list populated."""
+        graph_client._query = AsyncMock(return_value=[
+            _make_class_hierarchy_result(constructors=["UserService", "UserService"]),
+        ])
+
+        result = await graph_client.get_class_hierarchy("UserService")
+
+        assert result.constructors == ["UserService", "UserService"]
+
+    async def test_get_class_hierarchy_filters_null_from_lists(self, graph_client):
+        """Null entries in collected lists are filtered out."""
+        graph_client._query = AsyncMock(return_value=[
+            _make_class_hierarchy_result(
+                parents=[None, "BaseService", None],
+                children=[None],
+                interfaces=["IUserService", None],
+                implementors=[None, None],
+                methods=["getUser", None, "updateUser"],
+                fields=[None, "name"],
+                constructors=[None, "UserService"],
+            ),
+        ])
+
+        result = await graph_client.get_class_hierarchy("UserService")
+
+        assert result.parents == ["BaseService"]
+        assert result.children == []
+        assert result.interfaces == ["IUserService"]
+        assert result.implementors == []
+        assert result.methods == ["getUser", "updateUser"]
+        assert result.fields == ["name"]
+        assert result.constructors == ["UserService"]
+
+    async def test_get_class_hierarchy_returns_none_when_not_found(self, graph_client):
+        """_query returns [], returns None."""
+        graph_client._query = AsyncMock(return_value=[])
+
+        result = await graph_client.get_class_hierarchy("NonExistentClass")
+
+        assert result is None
+
+    async def test_get_class_hierarchy_derives_full_name_from_id(self, graph_client):
+        """full_name is derived by stripping 'repository::' prefix from id."""
+        graph_client._query = AsyncMock(return_value=[
+            _make_class_hierarchy_result(id="my-repo::com.example.UserService"),
+        ])
+
+        result = await graph_client.get_class_hierarchy("UserService")
+
+        assert result.full_name == "com.example.UserService"
+
+    async def test_get_class_hierarchy_full_name_fallback(self, graph_client):
+        """When id has no '::', falls back to name."""
+        graph_client._query = AsyncMock(return_value=[
+            _make_class_hierarchy_result(id="UserService", name="UserService"),
+        ])
+
+        result = await graph_client.get_class_hierarchy("UserService")
+
+        assert result.full_name == "UserService"
+
+    async def test_get_class_hierarchy_with_filters(self, graph_client):
+        """Verify file_path and repository filters work."""
+        graph_client._query = AsyncMock(return_value=[_make_class_hierarchy_result()])
+
+        await graph_client.get_class_hierarchy(
+            "UserService", repository="my-repo", file_path="UserService.java"
+        )
+
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "ENDS WITH" in cypher_arg
+        assert graph_client._query.call_args.kwargs["file_path"] == "UserService.java"
+        assert "c.repository = $repository" in cypher_arg
+
+    async def test_get_class_hierarchy_raises_on_ambiguous_match(self, graph_client):
+        """Class hierarchy lookups should not silently pick one of many matches."""
+        graph_client._query = AsyncMock(return_value=[
+            _make_class_hierarchy_result(file_path="src/a/UserService.java"),
+            _make_class_hierarchy_result(file_path="src/b/UserService.java"),
+        ])
+        with pytest.raises(ValueError, match="ambiguous"):
+            await graph_client.get_class_hierarchy("UserService")
+
+
+class TestListRepositories:
+    """Tests for GraphClient.list_repositories()."""
+
+    async def test_list_repositories_queries_repository_nodes(self, graph_client):
+        """Verify Cypher contains MATCH (r:Repository) not aggregation."""
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.list_repositories()
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "MATCH (r:Repository)" in cypher_arg
+
+    async def test_list_repositories_returns_query_results(self, graph_client):
+        """Returns list of dicts from _query."""
+        expected = [
+            {"name": "repo-a", "entity_count": 100, "last_indexed_at": "2026-01-01"},
+            {"name": "repo-b", "entity_count": 200, "last_indexed_at": "2026-02-01"},
+        ]
+        graph_client._query = AsyncMock(return_value=expected)
+        results = await graph_client.list_repositories()
+        assert results == expected
+        assert len(results) == 2
+        assert results[0]["name"] == "repo-a"
+        assert results[1]["entity_count"] == 200
+
+    async def test_list_repositories_empty(self, graph_client):
+        """Returns empty list when no repositories found."""
+        graph_client._query = AsyncMock(return_value=[])
+        results = await graph_client.list_repositories()
+        assert results == []
+
+
+class TestGetCodebaseOverview:
+    """Tests for GraphClient.get_codebase_overview()."""
+
+    async def test_get_codebase_overview_returns_stats(self, graph_client):
+        """Basic return with all counts."""
+        graph_client._query = AsyncMock(side_effect=[
+            [{
+                "files": 10,
+                "classes": 5,
+                "interfaces": 2,
+                "methods": 20,
+                "constructors": 3,
+                "fields": 8,
+                "packages_count": 4,
+                "hooks": 1,
+                "references": 6,
+                "exports": 9,
+                "languages": ["Java", "Python"],
+            }],  # overview
+            [{"name": "UserService"}, {"name": "OrderService"}],  # top classes
+            [{"name": "handleRequest", "class_name": "ApiController"}],  # entry points
+        ])
+
+        result = await graph_client.get_codebase_overview()
+
+        assert isinstance(result, CodebaseOverview)
+        assert result.total_files == 10
+        assert result.total_classes == 5
+        assert result.total_interfaces == 2
+        assert result.total_methods == 20
+        assert result.total_constructors == 3
+        assert result.total_fields == 8
+        assert result.total_packages == 4
+        assert result.total_hooks == 1
+        assert result.total_references == 6
+        assert result.total_exports == 9
+        assert result.languages == ["Java", "Python"]
+        assert result.top_level_classes == ["UserService", "OrderService"]
+        assert result.entry_points == ["ApiController.handleRequest"]
+
+    async def test_get_codebase_overview_includes_constructor_count(self, graph_client):
+        """Verify total_constructors populated."""
+        graph_client._query = AsyncMock(side_effect=[
+            [{
+                "files": 5,
+                "classes": 2,
+                "interfaces": 1,
+                "methods": 8,
+                "constructors": 7,
+                "fields": 3,
+                "packages_count": 2,
+                "hooks": 0,
+                "references": 1,
+                "exports": 4,
+                "languages": ["Java"],
+            }],
+            [],  # top classes
+            [],  # entry points
+        ])
+
+        result = await graph_client.get_codebase_overview()
+
+        assert result.total_constructors == 7
+
+    async def test_get_codebase_overview_with_repository_filter(self, graph_client):
+        """Verify repo filter in Cypher."""
+        graph_client._query = AsyncMock(side_effect=[
+            [{
+                "files": 10,
+                "classes": 5,
+                "interfaces": 1,
+                "methods": 20,
+                "constructors": 3,
+                "fields": 7,
+                "packages_count": 2,
+                "hooks": 0,
+                "references": 3,
+                "exports": 5,
+                "languages": ["Java"],
+            }],
+            [],  # top classes
+            [],  # entry points
+        ])
+
+        await graph_client.get_codebase_overview(repository="my-repo")
+
+        # Check all three queries for repository filter
+        overview_cypher = graph_client._query.call_args_list[0][0][0]
+        assert "f.repository = $repository" in overview_cypher
+        assert "c.repository = $repository" in overview_cypher
+        assert "m.repository = $repository" in overview_cypher
+
+        top_classes_cypher = graph_client._query.call_args_list[1][0][0]
+        assert "c.repository = $repository" in top_classes_cypher
+
+        entry_cypher = graph_client._query.call_args_list[2][0][0]
+        assert "m.repository = $repository" in entry_cypher
+
+    async def test_get_codebase_overview_includes_packages_when_requested(self, graph_client):
+        """include_packages=True triggers package query."""
+        graph_client._query = AsyncMock(side_effect=[
+            [{
+                "files": 10,
+                "classes": 5,
+                "interfaces": 2,
+                "methods": 20,
+                "constructors": 3,
+                "fields": 6,
+                "packages_count": 2,
+                "hooks": 0,
+                "references": 1,
+                "exports": 4,
+                "languages": ["Java"],
+                "packages": ["com.example", "com.util"],
+            }],
+            [],  # top classes
+            [],  # entry points
+        ])
+
+        result = await graph_client.get_codebase_overview(include_packages=True)
+
+        assert result.packages == ["com.example", "com.util"]
+        # Verify Cypher contains Package match
+        overview_cypher = graph_client._query.call_args_list[0][0][0]
+        assert "Package" in overview_cypher
+
+    async def test_get_codebase_overview_omits_packages_by_default(self, graph_client):
+        """include_packages=False returns empty packages."""
+        graph_client._query = AsyncMock(side_effect=[
+            [{
+                "files": 10,
+                "classes": 5,
+                "interfaces": 2,
+                "methods": 20,
+                "constructors": 3,
+                "fields": 6,
+                "packages_count": 2,
+                "hooks": 0,
+                "references": 1,
+                "exports": 4,
+                "languages": ["Java"],
+            }],
+            [],  # top classes
+            [],  # entry points
+        ])
+
+        result = await graph_client.get_codebase_overview()
+
+        assert result.packages == []
+
+    async def test_get_codebase_overview_entry_points_from_stereotypes(self, graph_client):
+        """Verify Cypher uses 'endpoint' IN m.stereotypes."""
+        graph_client._query = AsyncMock(side_effect=[
+            [{
+                "files": 10,
+                "classes": 5,
+                "interfaces": 0,
+                "methods": 20,
+                "constructors": 3,
+                "fields": 0,
+                "packages_count": 0,
+                "hooks": 0,
+                "references": 0,
+                "exports": 0,
+                "languages": ["Java"],
+            }],
+            [],  # top classes
+            [{"name": "handleRequest", "class_name": "ApiController"}],  # entry points
+        ])
+
+        await graph_client.get_codebase_overview()
+
+        entry_cypher = graph_client._query.call_args_list[2][0][0]
+        assert "'endpoint' IN m.stereotypes" in entry_cypher
+
+    async def test_get_codebase_overview_formats_entry_points(self, graph_client):
+        """Entry points formatted as 'ClassName.methodName'."""
+        graph_client._query = AsyncMock(side_effect=[
+            [{
+                "files": 10,
+                "classes": 5,
+                "interfaces": 0,
+                "methods": 20,
+                "constructors": 3,
+                "fields": 0,
+                "packages_count": 0,
+                "hooks": 0,
+                "references": 0,
+                "exports": 0,
+                "languages": ["Java"],
+            }],
+            [],  # top classes
+            [
+                {"name": "handleRequest", "class_name": "ApiController"},
+                {"name": "main", "class_name": None},
+            ],  # entry points
+        ])
+
+        result = await graph_client.get_codebase_overview()
+
+        assert result.entry_points == ["ApiController.handleRequest", "main"]
+
+    async def test_get_codebase_overview_empty_results(self, graph_client):
+        """Returns CodebaseOverview with defaults when no data."""
+        graph_client._query = AsyncMock(return_value=[])
+
+        result = await graph_client.get_codebase_overview()
+
+        assert isinstance(result, CodebaseOverview)
+        assert result.total_files == 0
+        assert result.total_classes == 0
+        assert result.total_interfaces == 0
+        assert result.total_methods == 0
+        assert result.total_constructors == 0
+        assert result.total_fields == 0
+        assert result.total_packages == 0
+        assert result.total_hooks == 0
+        assert result.total_references == 0
+        assert result.total_exports == 0
+        assert result.languages == []
+        assert result.packages == []
+        assert result.top_level_classes == []
+        assert result.entry_points == []
+
+
+def _make_impact_caller(
+    name="checkOrder",
+    file_path="src/OrderHelper.java",
+    repository="my-repo",
+    signature="void checkOrder()",
+    line_number=30,
+    stereotypes=None,
+    depth=1,
+):
+    """Helper to build a mock Neo4j result dict for get_impact callers."""
+    return {
+        "name": name,
+        "file_path": file_path,
+        "repository": repository,
+        "signature": signature,
+        "line_number": line_number,
+        "stereotypes": stereotypes if stereotypes is not None else [],
+        "depth": depth,
+    }
+
+
+def _make_impact_target(
+    name="processOrder",
+    entity_id="my-repo::OrderService.processOrder",
+    file_path="src/OrderService.java",
+    repository="my-repo",
+):
+    return {
+        "name": name,
+        "id": entity_id,
+        "file_path": file_path,
+        "repository": repository,
+    }
+
+
+class TestGetImpact:
+    """Tests for GraphClient.get_impact()."""
+
+    async def test_get_impact_returns_result(self, graph_client):
+        """Basic return with target info and counts."""
+        graph_client._query = AsyncMock(side_effect=[
+            # First call: method info
+            [_make_impact_target()],
+            # Second call: callers
+            [
+                _make_impact_caller(name="testProcessOrder", file_path="test/OrderTest.java", stereotypes=["test"], line_number=15, depth=1),
+                _make_impact_caller(name="handleOrderEndpoint", file_path="src/OrderController.java", stereotypes=["endpoint"], line_number=20, depth=2),
+                _make_impact_caller(name="checkOrder", file_path="src/OrderHelper.java", stereotypes=[], line_number=30, depth=1),
+            ],
+        ])
+
+        result = await graph_client.get_impact("processOrder")
+
+        assert isinstance(result, ImpactResult)
+        assert result.target_name == "processOrder"
+        assert result.target_file == "src/OrderService.java"
+        assert result.target_repository == "my-repo"
+        assert result.total_callers == 3
+        assert result.test_count == 1
+        assert result.endpoint_count == 1
+
+    async def test_get_impact_categorizes_by_stereotypes(self, graph_client):
+        """Test with stereotypes=['test'] and stereotypes=['endpoint']."""
+        graph_client._query = AsyncMock(side_effect=[
+            [_make_impact_target()],
+            [
+                _make_impact_caller(name="testProcessOrder", file_path="test/OrderTest.java", stereotypes=["test"], line_number=15, depth=1),
+                _make_impact_caller(name="handleOrderEndpoint", file_path="src/OrderController.java", stereotypes=["endpoint"], line_number=20, depth=2),
+                _make_impact_caller(name="checkOrder", file_path="src/OrderHelper.java", stereotypes=[], line_number=30, depth=1),
+            ],
+        ])
+
+        result = await graph_client.get_impact("processOrder")
+
+        assert len(result.affected_tests) == 1
+        assert result.affected_tests[0].name == "testProcessOrder"
+        assert result.affected_tests[0].is_test is True
+
+        assert len(result.affected_endpoints) == 1
+        assert result.affected_endpoints[0].name == "handleOrderEndpoint"
+        assert result.affected_endpoints[0].is_endpoint is True
+
+        assert len(result.other_callers) == 1
+        assert result.other_callers[0].name == "checkOrder"
+
+    async def test_get_impact_fallback_heuristics(self, graph_client):
+        """'test' in name -> is_test, 'controller' in name -> is_endpoint."""
+        graph_client._query = AsyncMock(side_effect=[
+            [_make_impact_target()],
+            [
+                _make_impact_caller(name="testOrderFlow", file_path="src/OrderFlow.java", stereotypes=[], line_number=10, depth=1),
+                _make_impact_caller(name="orderController", file_path="src/OrderCtrl.java", stereotypes=[], line_number=20, depth=2),
+            ],
+        ])
+
+        result = await graph_client.get_impact("processOrder")
+
+        assert len(result.affected_tests) == 1
+        assert result.affected_tests[0].name == "testOrderFlow"
+        assert result.affected_tests[0].is_test is True
+
+        assert len(result.affected_endpoints) == 1
+        assert result.affected_endpoints[0].name == "orderController"
+        assert result.affected_endpoints[0].is_endpoint is True
+
+    async def test_get_impact_returns_none_when_not_found(self, graph_client):
+        """Method query returns [], returns None."""
+        graph_client._query = AsyncMock(return_value=[])
+
+        result = await graph_client.get_impact("nonExistentMethod")
+
+        assert result is None
+
+    async def test_get_impact_summary_only(self, graph_client):
+        """Counts populated but caller lists empty."""
+        graph_client._query = AsyncMock(side_effect=[
+            [_make_impact_target()],
+            [
+                _make_impact_caller(name="testProcessOrder", stereotypes=["test"], depth=1),
+                _make_impact_caller(name="handleOrderEndpoint", stereotypes=["endpoint"], depth=2),
+                _make_impact_caller(name="checkOrder", stereotypes=[], depth=1),
+            ],
+        ])
+
+        result = await graph_client.get_impact("processOrder", summary_only=True)
+
+        assert result.test_count == 1
+        assert result.endpoint_count == 1
+        assert result.total_callers == 3
+        assert result.affected_tests == []
+        assert result.affected_endpoints == []
+        assert result.other_callers == []
+
+    async def test_get_impact_limit_caps_categories(self, graph_client):
+        """limit=1 caps each list."""
+        graph_client._query = AsyncMock(side_effect=[
+            [_make_impact_target()],
+            [
+                _make_impact_caller(name="test1", stereotypes=["test"], depth=1),
+                _make_impact_caller(name="test2", stereotypes=["test"], depth=2),
+                _make_impact_caller(name="endpoint1", stereotypes=["endpoint"], depth=1),
+                _make_impact_caller(name="endpoint2", stereotypes=["endpoint"], depth=2),
+                _make_impact_caller(name="other1", stereotypes=[], depth=1),
+                _make_impact_caller(name="other2", stereotypes=[], depth=2),
+            ],
+        ])
+
+        result = await graph_client.get_impact("processOrder", limit=1)
+
+        assert len(result.affected_tests) == 1
+        assert len(result.affected_endpoints) == 1
+        assert len(result.other_callers) == 1
+
+    async def test_get_impact_truncated_flag(self, graph_client):
+        """truncated=True when limit cuts results."""
+        graph_client._query = AsyncMock(side_effect=[
+            [_make_impact_target()],
+            [
+                _make_impact_caller(name="test1", stereotypes=["test"], depth=1),
+                _make_impact_caller(name="test2", stereotypes=["test"], depth=2),
+                _make_impact_caller(name="endpoint1", stereotypes=["endpoint"], depth=1),
+            ],
+        ])
+
+        result = await graph_client.get_impact("processOrder", limit=1)
+
+        assert result.truncated is True
+
+    async def test_get_impact_maps_line_number(self, graph_client):
+        """line_number mapped to line_start."""
+        graph_client._query = AsyncMock(side_effect=[
+            [_make_impact_target()],
+            [
+                _make_impact_caller(name="testProcessOrder", stereotypes=["test"], line_number=42, depth=1),
+            ],
+        ])
+
+        result = await graph_client.get_impact("processOrder")
+
+        assert result.affected_tests[0].line_start == 42
+
+    async def test_get_impact_matches_constructor(self, graph_client):
+        """Cypher contains (m:Method OR m:Constructor)."""
+        graph_client._query = AsyncMock(side_effect=[
+            [_make_impact_target(name="MyConstructor", entity_id="my-repo::MyClass.MyConstructor", file_path="src/MyClass.java")],
+            [],
+        ])
+
+        await graph_client.get_impact("MyConstructor")
+
+        # Both Cypher queries should contain the Method OR Constructor match
+        method_cypher = graph_client._query.call_args_list[0][0][0]
+        callers_cypher = graph_client._query.call_args_list[1][0][0]
+        assert "(m:Method OR m:Constructor)" in method_cypher
+        assert "(m:Method OR m:Constructor)" in callers_cypher
+
+    async def test_get_impact_uses_type_relationships_not_overrides(self, graph_client):
+        """Impact analysis should derive method family from the current graph schema."""
+        graph_client._query = AsyncMock(side_effect=[
+            [_make_impact_target()],
+            [],
+        ])
+        await graph_client.get_impact("processOrder")
+        callers_cypher = graph_client._query.call_args_list[1][0][0]
+        assert "IMPLEMENTS" in callers_cypher
+        assert "EXTENDS" in callers_cypher
+        assert "OVERRIDES" not in callers_cypher
+
+
+class TestFindSymbols:
+    """Tests for GraphClient.find_symbols()."""
+
+    async def test_find_symbols_queries_requested_entity_types(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.find_symbols("use", entity_types=["hook", "reference"])
+        cypher_arg = graph_client._query.call_args[0][0]
+        kwargs = graph_client._query.call_args.kwargs
+        assert "labels(n)" in cypher_arg
+        assert kwargs["labels"] == ["Hook", "Reference"]
+
+    async def test_find_symbols_applies_file_pattern_filter(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.find_symbols("Auth", file_pattern="*/api/*", repository="repo")
+        cypher_arg = graph_client._query.call_args[0][0]
+        kwargs = graph_client._query.call_args.kwargs
+        assert "n.repository = $repository" in cypher_arg
+        assert "n.file_path =~ $file_regex" in cypher_arg
+        assert kwargs["file_regex"] == "^.*/api/.*$"
+
+    async def test_find_symbols_maps_results(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "name": "useState",
+                "file_path": "src/App.tsx",
+                "repository": "repo",
+                "line_number": 12,
+                "line_end": 12,
+                "signature": None,
+                "code": None,
+                "entity_type": "Hook",
+            },
+        ])
+        results = await graph_client.find_symbols("useState", entity_types=["hook"])
+        assert len(results) == 1
+        assert isinstance(results[0], CodeEntity)
+        assert results[0].entity_type == "hook"
+        assert results[0].line_start == 12
+
+
+class TestGetFileContext:
+    """Tests for GraphClient.get_file_context()."""
+
+    async def test_get_file_context_returns_file_details(self, graph_client):
+        graph_client._query = AsyncMock(side_effect=[
+            [{"name": "App.tsx", "file_path": "src/App.tsx", "repository": "repo", "language": "TypeScript"}],
+            [{
+                "name": "App.tsx",
+                "file_path": "src/App.tsx",
+                "repository": "repo",
+                "language": "TypeScript",
+                "packages": ["src.components"],
+                "classes": ["App"],
+                "interfaces": ["Props"],
+                "top_level_methods": ["renderApp"],
+                "hooks": ["useState"],
+                "exports": [
+                    {
+                        "name": "App",
+                        "file_path": "src/App.tsx",
+                        "repository": "repo",
+                        "line_start": 3,
+                        "entity_type": "class",
+                    },
+                ],
+            }],
+        ])
+        result = await graph_client.get_file_context("App.tsx")
+        assert isinstance(result, FileContext)
+        assert result.file_path == "src/App.tsx"
+        assert result.language == "TypeScript"
+        assert result.packages == ["src.components"]
+        assert result.classes == ["App"]
+        assert result.interfaces == ["Props"]
+        assert result.top_level_methods == ["renderApp"]
+        assert result.hooks == ["useState"]
+        assert result.exports[0].name == "App"
+
+    async def test_get_file_context_raises_on_ambiguous_match(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[
+            {"name": "config.py", "file_path": "a/config.py", "repository": "repo", "language": "Python"},
+            {"name": "config.py", "file_path": "b/config.py", "repository": "repo", "language": "Python"},
+        ])
+        with pytest.raises(ValueError, match="ambiguous"):
+            await graph_client.get_file_context("config.py")
+
+
+class TestGetHookUsage:
+    """Tests for GraphClient.get_hook_usage()."""
+
+    async def test_get_hook_usage_returns_callers(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "name": "renderApp",
+                "file_path": "src/App.tsx",
+                "repository": "repo",
+                "signature": "function renderApp()",
+                "line_number": 15,
+                "entity_type": "Method",
+                "relationship_type": "USES_HOOK",
+            },
+        ])
+        results = await graph_client.get_hook_usage("useState")
+        assert len(results) == 1
+        assert results[0].name == "renderApp"
+        assert results[0].entity_type == "method"
+        assert results[0].relationship_type == "USES_HOOK"
+
+    async def test_get_hook_usage_applies_filters(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[])
+        await graph_client.get_hook_usage("useEffect", repository="repo", file_pattern="*/ui/*")
+        cypher_arg = graph_client._query.call_args[0][0]
+        kwargs = graph_client._query.call_args.kwargs
+        assert "h.name = $hook_name" in cypher_arg
+        assert "m.repository = $repository" in cypher_arg
+        assert "m.file_path =~ $file_regex" in cypher_arg
+        assert kwargs["file_regex"] == "^.*/ui/.*$"

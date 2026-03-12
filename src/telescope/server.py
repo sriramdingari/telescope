@@ -155,6 +155,7 @@ def _call_node_to_dict(node) -> dict:
         "repository": node.repository,
         "signature": node.signature,
         "line_start": node.line_start,
+        "depth": node.depth,
         "entity_type": node.entity_type,
         "relationship_type": node.relationship_type,
         "truncated": node.truncated,
@@ -352,28 +353,8 @@ async def get_function_context(
         "signature": result.signature,
         "docstring": result.docstring,
         "class_name": result.class_name,
-        "callers": [
-            {
-                "name": c.name,
-                "file_path": c.file_path,
-                "repository": c.repository,
-                "signature": c.signature,
-                "entity_type": c.entity_type,
-                "relationship_type": c.relationship_type,
-            }
-            for c in result.callers
-        ],
-        "callees": [
-            {
-                "name": c.name,
-                "file_path": c.file_path,
-                "repository": c.repository,
-                "signature": c.signature,
-                "entity_type": c.entity_type,
-                "relationship_type": c.relationship_type,
-            }
-            for c in result.callees
-        ],
+        "callers": [_call_node_to_dict(c) for c in result.callers],
+        "callees": [_call_node_to_dict(c) for c in result.callees],
     }
 
 

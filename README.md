@@ -142,6 +142,7 @@ get_callers("processPayment", repository="my-app", depth=2)
 | `limit` | int | 50 | Max results (capped at 200) |
 
 Each caller result includes `truncated` when additional callers exist beyond the limit.
+Caller results also include `depth`, the minimum call distance to the target.
 
 ### get_callees
 
@@ -152,6 +153,7 @@ get_callees("processPayment", repository="my-app")
 ```
 
 Same parameters as `get_callers`. Each callee result also includes `truncated` when additional targets exist beyond the limit.
+Callee results include `depth`, and can include unresolved `Reference` nodes plus `Hook` usage.
 
 ### get_function_context
 
@@ -200,7 +202,7 @@ get_impact("validateUser")                             # Full analysis
 
 ### get_file_context
 
-Get graph context for a single file: package membership, exports, top-level entities, constructors, fields, unresolved references, hooks used inside that file, and the file content hash.
+Get graph context for a single file: package membership, exports, top-level entities, class-scoped constructors and fields, unresolved references, hooks used inside that file, and the file content hash.
 
 ```
 get_file_context("src/App.tsx", repository="my-app")
@@ -208,7 +210,7 @@ get_file_context("src/App.tsx", repository="my-app")
 
 ### get_hook_usage
 
-Find the methods and constructors that use a materialized hook node such as `useState` or `useEffect`. Supports `repository`, `file_pattern`, `language`, `stereotype`, and `limit`. Each result includes `truncated` when additional users exist beyond the limit.
+Find the methods and constructors that use a materialized hook node such as `useState` or `useEffect`. Supports `repository`, `file_pattern`, `language`, `stereotype`, and `limit`. Each result includes `depth` and `truncated`.
 
 ```
 get_hook_usage("useState", repository="my-app")

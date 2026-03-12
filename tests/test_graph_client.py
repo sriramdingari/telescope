@@ -564,6 +564,24 @@ class TestGetCallers:
         assert len(results) == 1
         assert results[0].line_start == 42
 
+    async def test_get_callers_maps_query_depth(self, graph_client):
+        """Caller traversal depth should be preserved from the query result."""
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "name": "caller1",
+                "file_path": "src/main.py",
+                "repository": "my-repo",
+                "signature": "def caller1()",
+                "line_number": 42,
+                "depth": 2,
+            },
+        ])
+
+        results = await graph_client.get_callers("targetMethod")
+
+        assert len(results) == 1
+        assert results[0].depth == 2
+
     async def test_get_callers_empty_results(self, graph_client):
         """Returns empty list when no callers found."""
         graph_client._query = AsyncMock(return_value=[])
@@ -641,6 +659,16 @@ class TestGetCallees:
         assert "IMPLEMENTS" in cypher_arg
         assert "EXTENDS" in cypher_arg
         assert "OVERRIDES" not in cypher_arg
+
+    async def test_get_callees_avoids_hard_coded_implements_patterns(self, graph_client):
+        """Method-family traversal should avoid literal absent-type patterns that emit warnings."""
+        graph_client._query = AsyncMock(side_effect=[[], []])
+
+        await graph_client.get_callees("someMethod")
+
+        cypher_arg = graph_client._query.call_args_list[0][0][0]
+        assert "type(rel) IN ['IMPLEMENTS', 'EXTENDS']" in cypher_arg
+        assert "[:IMPLEMENTS|EXTENDS*1..3]" not in cypher_arg
 
     async def test_get_callees_uses_parameter_suffix_when_entity_id_is_java_style(self, graph_client):
         """Resolved Java methods should constrain callee family expansion by parameter signature."""
@@ -1023,6 +1051,28 @@ class TestGetClassHierarchy:
         assert "ENDS WITH" in cypher_arg
         assert graph_client._query.call_args.kwargs["file_path"] == "UserService.java"
         assert "c.repository = $repository" in cypher_arg
+
+    async def test_get_class_hierarchy_orders_by_returned_aliases(self, graph_client):
+        """Aggregated class hierarchy query must order by returned aliases, not pre-RETURN vars."""
+        graph_client._query = AsyncMock(return_value=[_make_class_hierarchy_result()])
+
+        await graph_client.get_class_hierarchy("UserService", repository="my-repo")
+
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "c.line_number AS line_number" in cypher_arg
+        assert "ORDER BY file_path, line_number" in cypher_arg
+        assert "ORDER BY c.file_path, c.line_number" not in cypher_arg
+
+    async def test_get_class_hierarchy_avoids_hard_coded_implements_patterns(self, graph_client):
+        """Hierarchy queries should use generic relationship filtering to avoid warnings."""
+        graph_client._query = AsyncMock(return_value=[_make_class_hierarchy_result()])
+
+        await graph_client.get_class_hierarchy("UserService", repository="my-repo")
+
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "type(parent_rel) = 'EXTENDS'" in cypher_arg
+        assert "type(impl_rel) = 'IMPLEMENTS'" in cypher_arg
+        assert "[:IMPLEMENTS]" not in cypher_arg
 
     async def test_get_class_hierarchy_raises_on_ambiguous_match(self, graph_client):
         """Class hierarchy lookups should not silently pick one of many matches."""
@@ -1807,6 +1857,47 @@ class TestGetFileContext:
         assert result.exports[0].entity_id == "repo::src/App.tsx::App"
         assert result.exports[0].content_hash == "deadbeef"
         assert result.exports[0].properties == {"export_type": "default"}
+
+    async def test_get_file_context_uses_file_scoped_members_for_packages_and_class_members(self, graph_client):
+        graph_client._query = AsyncMock(side_effect=[
+            [{
+                "name": "Service.java",
+                "file_path": "src/Service.java",
+                "repository": "repo",
+                "language": "Java",
+                "content_hash": "cafebabe",
+            }],
+            [{
+                "name": "Service.java",
+                "file_path": "src/Service.java",
+                "repository": "repo",
+                "language": "Java",
+                "content_hash": "cafebabe",
+                "packages": ["com.example"],
+                "classes": ["Service"],
+                "interfaces": [],
+                "top_level_methods": [],
+                "hooks": [],
+                "constructors": ["Service"],
+                "fields": ["client"],
+                "references": ["client.fetch"],
+                "exports": [],
+            }],
+        ])
+
+        result = await graph_client.get_file_context("Service.java", repository="repo")
+
+        cypher_arg = graph_client._query.call_args_list[1][0][0]
+        assert "member.file_path = f.file_path" in cypher_arg
+        assert "ctor.repository = f.repository AND ctor.file_path = f.file_path" in cypher_arg
+        assert "field.repository = f.repository AND field.file_path = f.file_path" in cypher_arg
+        assert "ref.repository = f.repository AND ref.file_path = f.file_path" in cypher_arg
+        assert "OPTIONAL MATCH (f)-[:IN_PACKAGE]->(pkg:Package)" not in cypher_arg
+        assert result is not None
+        assert result.packages == ["com.example"]
+        assert result.constructors == ["Service"]
+        assert result.fields == ["client"]
+        assert result.references == ["client.fetch"]
 
     async def test_get_file_context_raises_on_ambiguous_match(self, graph_client):
         graph_client._query = AsyncMock(return_value=[

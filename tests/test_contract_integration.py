@@ -48,6 +48,26 @@ class TestConstellationContract:
         assert hook_usage[0].name == "App"
         assert hook_usage[0].relationship_type == "USES_HOOK"
 
+    async def test_java_file_context_includes_class_scoped_members(
+        self,
+        live_graph_client,
+        seeded_contract_repository,
+    ):
+        repository = seeded_contract_repository
+
+        file_context = await live_graph_client.get_file_context(
+            "Service.java",
+            repository=repository,
+        )
+
+        assert file_context is not None
+        assert file_context.name == "Service.java"
+        assert file_context.packages == ["com.example"]
+        assert file_context.classes == ["Service"]
+        assert file_context.constructors == ["Service"]
+        assert file_context.fields == ["client"]
+        assert file_context.references == ["client.fetch"]
+
     async def test_call_graph_queries_match_java_parser_output(
         self,
         live_graph_client,
@@ -72,5 +92,8 @@ class TestConstellationContract:
         )
 
         assert [caller.name for caller in callers] == ["run"]
-        assert [callee.name for callee in callees] == ["helper"]
+        assert [(callee.name, callee.entity_type) for callee in callees] == [
+            ("helper", "method"),
+            ("client.fetch", "reference"),
+        ]
         assert any(symbol.entity_type == "method" for symbol in symbols)

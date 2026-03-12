@@ -452,10 +452,12 @@ class GraphClient:
         return f"""
             OPTIONAL MATCH (owner)-[:HAS_METHOD|HAS_CONSTRUCTOR]->({alias})
             WHERE owner:Class OR owner:Interface
-            OPTIONAL MATCH (owner)-[:IMPLEMENTS|EXTENDS*1..3]->(up_owner)
+            OPTIONAL MATCH (owner)-[up_rels*1..3]->(up_owner)
             WHERE up_owner:Class OR up_owner:Interface
-            OPTIONAL MATCH (down_owner)-[:IMPLEMENTS|EXTENDS*1..3]->(owner)
+              AND all(rel IN up_rels WHERE type(rel) IN ['IMPLEMENTS', 'EXTENDS'])
+            OPTIONAL MATCH (down_owner)-[down_rels*1..3]->(owner)
             WHERE down_owner:Class OR down_owner:Interface
+              AND all(rel IN down_rels WHERE type(rel) IN ['IMPLEMENTS', 'EXTENDS'])
             WITH {alias}, owner,
                  collect(DISTINCT up_owner) + collect(DISTINCT down_owner) AS related_owners
             UNWIND CASE
@@ -632,13 +634,15 @@ class GraphClient:
         cypher = f"""
             {match_clause}
             {self._method_family_fragment("m")}
-            MATCH (caller)-[:CALLS*1..{depth}]->(method)
+            MATCH path = (caller)-[:CALLS*1..{depth}]->(method)
             WHERE caller:Method OR caller:Constructor
+            WITH caller, min(length(path)) AS depth
             RETURN DISTINCT caller.name AS name, caller.file_path AS file_path,
                    caller.repository AS repository,
                    caller.signature AS signature, caller.line_number AS line_number,
-                   head(labels(caller)) AS entity_type, 'CALLS' AS relationship_type
-            ORDER BY caller.file_path, caller.line_number
+                   head(labels(caller)) AS entity_type, 'CALLS' AS relationship_type,
+                   depth
+            ORDER BY depth, caller.file_path, caller.line_number
             LIMIT $query_limit
         """
 
@@ -653,6 +657,7 @@ class GraphClient:
                 repository=r.get("repository"),
                 signature=r.get("signature"),
                 line_start=r.get("line_number"),
+                depth=r.get("depth", 1),
                 entity_type=self._label_to_entity_type(r.get("entity_type")),
                 relationship_type=r.get("relationship_type", "CALLS"),
                 truncated=truncated,
@@ -809,15 +814,19 @@ class GraphClient:
         )
         cypher = f"""
             {match_clause}
-            OPTIONAL MATCH (c)-[:EXTENDS]->(parent)
-            OPTIONAL MATCH (child)-[:EXTENDS]->(c)
-            OPTIONAL MATCH (c)-[:IMPLEMENTS]->(iface)
-            OPTIONAL MATCH (impl)-[:IMPLEMENTS]->(c)
+            OPTIONAL MATCH (c)-[parent_rel]->(parent)
+            WHERE type(parent_rel) = 'EXTENDS'
+            OPTIONAL MATCH (child)-[child_rel]->(c)
+            WHERE type(child_rel) = 'EXTENDS'
+            OPTIONAL MATCH (c)-[impl_rel]->(iface)
+            WHERE type(impl_rel) = 'IMPLEMENTS'
+            OPTIONAL MATCH (impl)-[implemented_by_rel]->(c)
+            WHERE type(implemented_by_rel) = 'IMPLEMENTS'
             OPTIONAL MATCH (c)-[:HAS_METHOD]->(m:Method)
             OPTIONAL MATCH (c)-[:HAS_FIELD]->(f:Field)
             OPTIONAL MATCH (c)-[:HAS_CONSTRUCTOR]->(ctor:Constructor)
             RETURN c.name AS name, c.id AS id, c.file_path AS file_path,
-                   c.repository AS repository, labels(c) AS labels,
+                   c.line_number AS line_number, c.repository AS repository, labels(c) AS labels,
                    collect(DISTINCT parent.name) AS parents,
                    collect(DISTINCT child.name) AS children,
                    collect(DISTINCT iface.name) AS interfaces,
@@ -825,7 +834,7 @@ class GraphClient:
                    collect(DISTINCT m.name) AS methods,
                    collect(DISTINCT f.name) AS fields,
                    collect(DISTINCT ctor.name) AS constructors
-            ORDER BY c.file_path, c.line_number
+            ORDER BY file_path, line_number
             LIMIT 2
         """
 
@@ -1184,21 +1193,27 @@ class GraphClient:
 
         cypher = """
             MATCH (f:File {repository: $repository, file_path: $file_path})
-            OPTIONAL MATCH (f)-[:IN_PACKAGE]->(pkg:Package)
+            OPTIONAL MATCH (member)-[:IN_PACKAGE]->(pkg:Package)
+            WHERE member.repository = f.repository AND member.file_path = f.file_path
             WITH f, collect(DISTINCT pkg.name) AS packages
-            OPTIONAL MATCH (f)-[:CONTAINS]->(class:Class)
-            WITH f, packages, collect(DISTINCT class.name) AS classes
-            OPTIONAL MATCH (f)-[:CONTAINS]->(iface:Interface)
+            OPTIONAL MATCH (cls:Class)
+            WHERE cls.repository = f.repository AND cls.file_path = f.file_path
+            WITH f, packages, collect(DISTINCT cls.name) AS classes
+            OPTIONAL MATCH (iface:Interface)
+            WHERE iface.repository = f.repository AND iface.file_path = f.file_path
             WITH f, packages, classes, collect(DISTINCT iface.name) AS interfaces
             OPTIONAL MATCH (f)-[:CONTAINS]->(method:Method)
             WITH f, packages, classes, interfaces, collect(DISTINCT method.name) AS top_level_methods
-            OPTIONAL MATCH (f)-[:CONTAINS]->(ctor:Constructor)
+            OPTIONAL MATCH (ctor:Constructor)
+            WHERE ctor.repository = f.repository AND ctor.file_path = f.file_path
             WITH f, packages, classes, interfaces, top_level_methods,
                  collect(DISTINCT ctor.name) AS constructors
-            OPTIONAL MATCH (f)-[:CONTAINS]->(field:Field)
+            OPTIONAL MATCH (field:Field)
+            WHERE field.repository = f.repository AND field.file_path = f.file_path
             WITH f, packages, classes, interfaces, top_level_methods, constructors,
                  collect(DISTINCT field.name) AS fields
-            OPTIONAL MATCH (f)-[:CONTAINS]->(ref:Reference)
+            OPTIONAL MATCH (ref:Reference)
+            WHERE ref.repository = f.repository AND ref.file_path = f.file_path
             WITH f, packages, classes, interfaces, top_level_methods, constructors, fields,
                  collect(DISTINCT ref.name) AS references
             OPTIONAL MATCH (f)-[export_rel:EXPORTS]->(exported)
@@ -1216,8 +1231,8 @@ class GraphClient:
                      entity_properties: properties(exported),
                      relationship_properties: properties(export_rel)
                  }) AS exports
-            OPTIONAL MATCH (caller)-[:USES_HOOK]->(hook:Hook)
-            WHERE caller.repository = f.repository AND caller.file_path = f.file_path
+            OPTIONAL MATCH (hook:Hook)
+            WHERE hook.repository = f.repository AND hook.file_path = f.file_path
             RETURN f.name AS name, f.file_path AS file_path,
                    f.repository AS repository, f.language AS language,
                    f.content_hash AS content_hash,

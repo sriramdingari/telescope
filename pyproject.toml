@@ -37,3 +37,6 @@ sources = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: requires local Neo4j plus Constellation parser environment",
+]

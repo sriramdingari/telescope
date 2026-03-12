@@ -88,11 +88,11 @@ claude mcp add-json telescope --scope user '{
 
 ## Tools
 
-Telescope exposes 11 tools via the MCP protocol:
+Telescope exposes 13 tools via the MCP protocol:
 
 ### search_code
 
-Semantic code search using vector similarity. Better than grep for conceptual searches like "authentication logic" or "database connection handling".
+Semantic code search using vector similarity. Better than grep for conceptual searches like "authentication logic" or "database connection handling". Results now include stable entity ids plus graph metadata such as language, return type, modifiers, stereotypes, content hashes, and custom properties when present. Identifier-like queries such as `useState`, `MyClass`, or `src/App.tsx` automatically blend in exact graph symbol matches.
 
 ```
 search_code("payment processing", repository="my-app", entity_type="method", code_mode="preview")
@@ -104,15 +104,25 @@ search_code("payment processing", repository="my-app", entity_type="method", cod
 | `repository` | string | — | Filter by repository name |
 | `entity_type` | string | — | `"method"`, `"class"`, `"interface"`, or `"constructor"` |
 | `file_pattern` | string | — | Filter by file path pattern |
+| `language` | string | — | Filter by persisted language |
+| `stereotype` | string | — | Filter by persisted stereotype |
 | `limit` | int | 10 | Max results (capped at 20) |
 | `code_mode` | string | `"preview"` | `"none"`, `"signature"`, `"preview"` (10 lines), `"full"` |
 
 ### find_symbols
 
-Exact/substring graph lookup across all persisted entity types, including files, packages, fields, hooks, and references.
+Exact/substring graph lookup across all persisted entity types, including files, packages, fields, hooks, and references. Results carry the same metadata-rich shape as `search_code`, and also support `language` and `stereotype` filters.
 
 ```
 find_symbols("useState", entity_types=["hook"], repository="my-app")
+```
+
+### get_repository_context
+
+Get one repository's source metadata plus aggregate graph statistics.
+
+```
+get_repository_context("my-app")
 ```
 
 ### get_callers
@@ -129,6 +139,9 @@ get_callers("processPayment", repository="my-app", depth=2)
 | `repository` | string | — | Filter by repository |
 | `file_path` | string | — | Disambiguate by file path |
 | `depth` | int | 1 | Traversal depth (max 3) |
+| `limit` | int | 50 | Max results (capped at 200) |
+
+Each caller result includes `truncated` when additional callers exist beyond the limit.
 
 ### get_callees
 
@@ -138,7 +151,7 @@ Find all functions, unresolved references, and hooks used by the specified metho
 get_callees("processPayment", repository="my-app")
 ```
 
-Same parameters as `get_callers`.
+Same parameters as `get_callers`. Each callee result also includes `truncated` when additional targets exist beyond the limit.
 
 ### get_function_context
 
@@ -156,6 +169,14 @@ Get inheritance hierarchy for a class or interface, including parents, children,
 
 ```
 get_class_hierarchy("UserService", repository="my-app")
+```
+
+### get_package_context
+
+Get package or namespace membership, including files, classes, methods, hooks, references, and direct child packages.
+
+```
+get_package_context("src.services", repository="my-app")
 ```
 
 ### get_impact
@@ -179,7 +200,7 @@ get_impact("validateUser")                             # Full analysis
 
 ### get_file_context
 
-Get graph context for a single file: package membership, exports, top-level entities, and hooks used inside that file.
+Get graph context for a single file: package membership, exports, top-level entities, constructors, fields, unresolved references, hooks used inside that file, and the file content hash.
 
 ```
 get_file_context("src/App.tsx", repository="my-app")
@@ -187,7 +208,7 @@ get_file_context("src/App.tsx", repository="my-app")
 
 ### get_hook_usage
 
-Find the methods and constructors that use a materialized hook node such as `useState` or `useEffect`.
+Find the methods and constructors that use a materialized hook node such as `useState` or `useEffect`. Supports `repository`, `file_pattern`, `language`, `stereotype`, and `limit`. Each result includes `truncated` when additional users exist beyond the limit.
 
 ```
 get_hook_usage("useState", repository="my-app")
@@ -227,6 +248,31 @@ git clone https://github.com/sriramdingari/telescope.git
 cd telescope
 pip install -e ".[dev]"
 python -m pytest -v
+```
+
+### Live Contract Tests
+
+Telescope includes an opt-in integration suite that seeds Neo4j with real parser output from Constellation and verifies the query contract end to end.
+
+Requirements:
+
+- local Neo4j reachable through `NEO4J_URI`-style settings
+- a working Constellation checkout with its parser dependencies installed
+
+Environment:
+
+- `TELESCOPE_RUN_INTEGRATION=1` enables the live tests
+- `CONSTELLATION_ROOT` points at the Constellation checkout
+- `CONSTELLATION_PYTHON` optionally points at the Python executable inside Constellation's environment
+- `TELESCOPE_TEST_NEO4J_URI`, `TELESCOPE_TEST_NEO4J_USER`, and `TELESCOPE_TEST_NEO4J_PASSWORD` override the default local Neo4j settings
+
+Example:
+
+```bash
+TELESCOPE_RUN_INTEGRATION=1 \
+CONSTELLATION_ROOT=/path/to/Constellation \
+CONSTELLATION_PYTHON=/path/to/Constellation/.venv/bin/python \
+python -m pytest -v -m integration
 ```
 
 ## License

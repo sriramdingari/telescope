@@ -1,6 +1,7 @@
 """Data models for Telescope query results."""
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -9,6 +10,7 @@ class CodeEntity:
     name: str
     file_path: str
     repository: str | None = None
+    entity_id: str | None = None
     line_start: int | None = None
     line_end: int | None = None
     code: str | None = None
@@ -16,6 +18,12 @@ class CodeEntity:
     docstring: str | None = None
     score: float = 0.0
     entity_type: str = "method"
+    language: str | None = None
+    return_type: str | None = None
+    modifiers: list[str] = field(default_factory=list)
+    stereotypes: list[str] = field(default_factory=list)
+    content_hash: str | None = None
+    properties: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -31,6 +39,7 @@ class CallGraphNode:
     is_endpoint: bool = False
     entity_type: str = "method"
     relationship_type: str = "CALLS"
+    truncated: bool = False
 
 
 @dataclass
@@ -91,12 +100,16 @@ class FileContext:
     file_path: str
     repository: str | None = None
     language: str | None = None
+    content_hash: str | None = None
     packages: list[str] = field(default_factory=list)
     exports: list[CodeEntity] = field(default_factory=list)
     classes: list[str] = field(default_factory=list)
     interfaces: list[str] = field(default_factory=list)
     top_level_methods: list[str] = field(default_factory=list)
     hooks: list[str] = field(default_factory=list)
+    constructors: list[str] = field(default_factory=list)
+    fields: list[str] = field(default_factory=list)
+    references: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -112,3 +125,41 @@ class ImpactResult:
     affected_endpoints: list[CallGraphNode] = field(default_factory=list)
     other_callers: list[CallGraphNode] = field(default_factory=list)
     truncated: bool = False
+
+
+@dataclass
+class RepositoryContext:
+    """Repository-level metadata and aggregate graph statistics."""
+    name: str
+    source: str | None = None
+    entity_count: int = 0
+    last_indexed_at: str | None = None
+    last_commit_sha: str | None = None
+    total_files: int = 0
+    total_classes: int = 0
+    total_interfaces: int = 0
+    total_methods: int = 0
+    total_constructors: int = 0
+    total_fields: int = 0
+    total_packages: int = 0
+    total_hooks: int = 0
+    total_references: int = 0
+    total_exports: int = 0
+    languages: list[str] = field(default_factory=list)
+    top_level_classes: list[str] = field(default_factory=list)
+    entry_points: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PackageContext:
+    """Package or namespace members resolved from Constellation's graph."""
+    name: str
+    repository: str | None = None
+    package_id: str | None = None
+    files: list[str] = field(default_factory=list)
+    classes: list[str] = field(default_factory=list)
+    interfaces: list[str] = field(default_factory=list)
+    methods: list[str] = field(default_factory=list)
+    hooks: list[str] = field(default_factory=list)
+    references: list[str] = field(default_factory=list)
+    child_packages: list[str] = field(default_factory=list)

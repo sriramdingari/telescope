@@ -5,12 +5,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from telescope.models import (
     CodeEntity, CallGraphNode, FileContext, FunctionContext,
-    ClassHierarchy, CodebaseOverview, ImpactResult,
+    ClassHierarchy, CodebaseOverview, ImpactResult, PackageContext, RepositoryContext,
 )
 from telescope.server import (
     search_code, get_callers, get_callees, get_function_context,
     get_class_hierarchy, list_repositories, get_codebase_overview, get_file_context,
-    get_hook_usage, get_impact, find_symbols,
+    get_hook_usage, get_impact, find_symbols, get_package_context, get_repository_context,
 )
 
 
@@ -67,11 +67,18 @@ class TestSearchCodeTool:
                 name="authenticate",
                 file_path="src/auth.py",
                 repository="my-repo",
+                entity_id="my-repo::src/auth.py::authenticate",
                 line_start=10,
                 line_end=25,
                 code="def authenticate(): ...",
                 signature="def authenticate()",
                 entity_type="method",
+                language="Python",
+                return_type="bool",
+                modifiers=["async"],
+                stereotypes=["endpoint"],
+                content_hash="deadbeef",
+                properties={"visibility": "public"},
             ),
         ]
         result = await search_code(query="auth", ctx=mock_ctx)
@@ -80,12 +87,33 @@ class TestSearchCodeTool:
             "name": "authenticate",
             "file_path": "src/auth.py",
             "repository": "my-repo",
+            "entity_id": "my-repo::src/auth.py::authenticate",
             "line_start": 10,
             "line_end": 25,
             "code": "def authenticate(): ...",
             "signature": "def authenticate()",
             "entity_type": "method",
+            "language": "Python",
+            "return_type": "bool",
+            "modifiers": ["async"],
+            "stereotypes": ["endpoint"],
+            "content_hash": "deadbeef",
+            "properties": {"visibility": "public"},
         }
+
+    async def test_passes_language_and_stereotype_filters(self, mock_ctx, mock_graph):
+        mock_graph.search_code.return_value = []
+
+        await search_code(
+            query="auth",
+            language="Python",
+            stereotype="endpoint",
+            ctx=mock_ctx,
+        )
+
+        call_kwargs = mock_graph.search_code.call_args.kwargs
+        assert call_kwargs["language"] == "Python"
+        assert call_kwargs["stereotype"] == "endpoint"
 
 
 # =============================================================================
@@ -112,6 +140,7 @@ class TestGetCallersTool:
                 line_start=42,
                 entity_type="method",
                 relationship_type="CALLS",
+                truncated=True,
             ),
         ]
         result = await get_callers(method_name="process", ctx=mock_ctx)
@@ -124,7 +153,14 @@ class TestGetCallersTool:
             "line_start": 42,
             "entity_type": "method",
             "relationship_type": "CALLS",
+            "truncated": True,
         }
+
+    async def test_passes_limit_through_to_graph(self, mock_ctx, mock_graph):
+        mock_graph.get_callers.return_value = []
+        await get_callers(method_name="foo", limit=80, ctx=mock_ctx)
+        call_kwargs = mock_graph.get_callers.call_args.kwargs
+        assert call_kwargs["limit"] == 80
 
 
 # =============================================================================
@@ -151,6 +187,7 @@ class TestGetCalleesTool:
                 line_start=15,
                 entity_type="reference",
                 relationship_type="CALLS",
+                truncated=True,
             ),
         ]
         result = await get_callees(method_name="process", ctx=mock_ctx)
@@ -163,7 +200,14 @@ class TestGetCalleesTool:
             "line_start": 15,
             "entity_type": "reference",
             "relationship_type": "CALLS",
+            "truncated": True,
         }
+
+    async def test_passes_limit_through_to_graph(self, mock_ctx, mock_graph):
+        mock_graph.get_callees.return_value = []
+        await get_callees(method_name="foo", limit=80, ctx=mock_ctx)
+        call_kwargs = mock_graph.get_callees.call_args.kwargs
+        assert call_kwargs["limit"] == 80
 
 
 # =============================================================================
@@ -273,6 +317,94 @@ class TestListRepositoriesTool:
         mock_graph.list_repositories.assert_awaited_once()
 
 
+class TestGetRepositoryContextTool:
+    async def test_raises_on_not_found(self, mock_ctx, mock_graph):
+        mock_graph.get_repository_context.return_value = None
+        with pytest.raises(ValueError, match="Repository 'missing' not found"):
+            await get_repository_context(repository="missing", ctx=mock_ctx)
+
+    async def test_returns_repository_context(self, mock_ctx, mock_graph):
+        mock_graph.get_repository_context.return_value = RepositoryContext(
+            name="repo-a",
+            source="https://github.com/example/repo-a",
+            entity_count=123,
+            last_indexed_at="2026-03-12T10:00:00+00:00",
+            last_commit_sha="abc123",
+            total_files=20,
+            total_classes=4,
+            total_interfaces=1,
+            total_methods=16,
+            total_constructors=2,
+            total_fields=9,
+            total_packages=3,
+            total_hooks=1,
+            total_references=5,
+            total_exports=7,
+            languages=["Python", "TypeScript"],
+            top_level_classes=["App"],
+            entry_points=["App.main"],
+        )
+
+        result = await get_repository_context(repository="repo-a", ctx=mock_ctx)
+
+        assert result == {
+            "name": "repo-a",
+            "source": "https://github.com/example/repo-a",
+            "entity_count": 123,
+            "last_indexed_at": "2026-03-12T10:00:00+00:00",
+            "last_commit_sha": "abc123",
+            "total_files": 20,
+            "total_classes": 4,
+            "total_interfaces": 1,
+            "total_methods": 16,
+            "total_constructors": 2,
+            "total_fields": 9,
+            "total_packages": 3,
+            "total_hooks": 1,
+            "total_references": 5,
+            "total_exports": 7,
+            "languages": ["Python", "TypeScript"],
+            "top_level_classes": ["App"],
+            "entry_points": ["App.main"],
+        }
+
+
+class TestGetPackageContextTool:
+    async def test_raises_on_not_found(self, mock_ctx, mock_graph):
+        mock_graph.get_package_context.return_value = None
+        with pytest.raises(ValueError, match="Package 'src.services' not found"):
+            await get_package_context(package_name="src.services", ctx=mock_ctx)
+
+    async def test_returns_package_context(self, mock_ctx, mock_graph):
+        mock_graph.get_package_context.return_value = PackageContext(
+            name="src.services",
+            repository="repo-a",
+            package_id="repo-a::src.services",
+            files=["src/services/user.py"],
+            classes=["UserService"],
+            interfaces=["IUserService"],
+            methods=["build_service"],
+            hooks=["useService"],
+            references=["requests.get"],
+            child_packages=["src.services.internal"],
+        )
+
+        result = await get_package_context(package_name="src.services", repository="repo-a", ctx=mock_ctx)
+
+        assert result == {
+            "name": "src.services",
+            "repository": "repo-a",
+            "package_id": "repo-a::src.services",
+            "files": ["src/services/user.py"],
+            "classes": ["UserService"],
+            "interfaces": ["IUserService"],
+            "methods": ["build_service"],
+            "hooks": ["useService"],
+            "references": ["requests.get"],
+            "child_packages": ["src.services.internal"],
+        }
+
+
 # =============================================================================
 # get_codebase_overview
 # =============================================================================
@@ -342,8 +474,12 @@ class TestFindSymbolsTool:
                 name="useState",
                 file_path="src/App.tsx",
                 repository="repo",
+                entity_id="repo::src/App.tsx::useState",
                 line_start=12,
                 entity_type="hook",
+                language="TypeScript",
+                content_hash="deadbeef",
+                properties={"symbol": "useState"},
             ),
         ]
         result = await find_symbols(query="useState", entity_types=["hook"], ctx=mock_ctx)
@@ -352,13 +488,34 @@ class TestFindSymbolsTool:
                 "name": "useState",
                 "file_path": "src/App.tsx",
                 "repository": "repo",
+                "entity_id": "repo::src/App.tsx::useState",
                 "line_start": 12,
                 "line_end": None,
                 "code": None,
                 "signature": None,
                 "entity_type": "hook",
+                "language": "TypeScript",
+                "return_type": None,
+                "modifiers": [],
+                "stereotypes": [],
+                "content_hash": "deadbeef",
+                "properties": {"symbol": "useState"},
             },
         ]
+
+    async def test_passes_language_and_stereotype_filters(self, mock_ctx, mock_graph):
+        mock_graph.find_symbols.return_value = []
+
+        await find_symbols(
+            query="auth",
+            language="Python",
+            stereotype="test",
+            ctx=mock_ctx,
+        )
+
+        call_kwargs = mock_graph.find_symbols.call_args.kwargs
+        assert call_kwargs["language"] == "Python"
+        assert call_kwargs["stereotype"] == "test"
 
 
 # =============================================================================
@@ -378,22 +535,43 @@ class TestGetFileContextTool:
             file_path="src/App.tsx",
             repository="repo",
             language="TypeScript",
+            content_hash="deadbeef",
             packages=["src.components"],
-            exports=[CodeEntity(name="App", file_path="src/App.tsx", repository="repo", entity_type="class")],
+            exports=[
+                CodeEntity(
+                    name="App",
+                    file_path="src/App.tsx",
+                    repository="repo",
+                    entity_id="repo::src/App.tsx::App",
+                    entity_type="class",
+                    content_hash="deadbeef",
+                    properties={"export_type": "default"},
+                )
+            ],
             classes=["App"],
             interfaces=["Props"],
             top_level_methods=["renderApp"],
             hooks=["useState"],
+            constructors=["App"],
+            fields=["title"],
+            references=["React.Fragment"],
         )
         result = await get_file_context(file_path="App.tsx", ctx=mock_ctx)
         assert result["name"] == "App.tsx"
         assert result["language"] == "TypeScript"
+        assert result["content_hash"] == "deadbeef"
         assert result["packages"] == ["src.components"]
         assert result["classes"] == ["App"]
         assert result["interfaces"] == ["Props"]
         assert result["top_level_methods"] == ["renderApp"]
         assert result["hooks"] == ["useState"]
+        assert result["constructors"] == ["App"]
+        assert result["fields"] == ["title"]
+        assert result["references"] == ["React.Fragment"]
         assert result["exports"][0]["name"] == "App"
+        assert result["exports"][0]["entity_id"] == "repo::src/App.tsx::App"
+        assert result["exports"][0]["content_hash"] == "deadbeef"
+        assert result["exports"][0]["properties"] == {"export_type": "default"}
 
 
 # =============================================================================
@@ -412,6 +590,7 @@ class TestGetHookUsageTool:
                 line_start=15,
                 entity_type="method",
                 relationship_type="USES_HOOK",
+                truncated=True,
             ),
         ]
         result = await get_hook_usage(hook_name="useState", ctx=mock_ctx)
@@ -424,8 +603,25 @@ class TestGetHookUsageTool:
                 "line_start": 15,
                 "entity_type": "method",
                 "relationship_type": "USES_HOOK",
+                "truncated": True,
             },
         ]
+
+    async def test_passes_limit_language_and_stereotype_filters(self, mock_ctx, mock_graph):
+        mock_graph.get_hook_usage.return_value = []
+
+        await get_hook_usage(
+            hook_name="useState",
+            limit=80,
+            language="TypeScript",
+            stereotype="test",
+            ctx=mock_ctx,
+        )
+
+        call_kwargs = mock_graph.get_hook_usage.call_args.kwargs
+        assert call_kwargs["limit"] == 80
+        assert call_kwargs["language"] == "TypeScript"
+        assert call_kwargs["stereotype"] == "test"
 
 
 # =============================================================================

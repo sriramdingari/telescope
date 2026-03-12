@@ -9,6 +9,8 @@ from telescope.models import (
     FileContext,
     FunctionContext,
     ImpactResult,
+    PackageContext,
+    RepositoryContext,
 )
 
 
@@ -25,6 +27,7 @@ class TestCodeEntity:
             name="my_func",
             file_path="/src/foo.py",
             repository="my-repo",
+            entity_id="my-repo::src/foo.py::my_func",
             line_start=10,
             line_end=20,
             code="def my_func(): pass",
@@ -32,10 +35,17 @@ class TestCodeEntity:
             docstring="Does stuff.",
             score=0.95,
             entity_type="function",
+            language="Python",
+            return_type="None",
+            modifiers=["async"],
+            stereotypes=["endpoint"],
+            content_hash="abc123",
+            properties={"visibility": "public"},
         )
         assert entity.name == "my_func"
         assert entity.file_path == "/src/foo.py"
         assert entity.repository == "my-repo"
+        assert entity.entity_id == "my-repo::src/foo.py::my_func"
         assert entity.line_start == 10
         assert entity.line_end == 20
         assert entity.code == "def my_func(): pass"
@@ -43,10 +53,20 @@ class TestCodeEntity:
         assert entity.docstring == "Does stuff."
         assert entity.score == 0.95
         assert entity.entity_type == "function"
+        assert entity.language == "Python"
+        assert entity.return_type == "None"
+        assert entity.modifiers == ["async"]
+        assert entity.stereotypes == ["endpoint"]
+        assert entity.content_hash == "abc123"
+        assert entity.properties == {"visibility": "public"}
 
     def test_default_repository_is_none(self):
         entity = CodeEntity(name="f", file_path="/a.py")
         assert entity.repository is None
+
+    def test_default_entity_id_is_none(self):
+        entity = CodeEntity(name="f", file_path="/a.py")
+        assert entity.entity_id is None
 
     def test_default_line_start_is_none(self):
         entity = CodeEntity(name="f", file_path="/a.py")
@@ -76,6 +96,30 @@ class TestCodeEntity:
         entity = CodeEntity(name="f", file_path="/a.py")
         assert entity.entity_type == "method"
 
+    def test_default_language_is_none(self):
+        entity = CodeEntity(name="f", file_path="/a.py")
+        assert entity.language is None
+
+    def test_default_return_type_is_none(self):
+        entity = CodeEntity(name="f", file_path="/a.py")
+        assert entity.return_type is None
+
+    def test_default_modifiers_is_empty_list(self):
+        entity = CodeEntity(name="f", file_path="/a.py")
+        assert entity.modifiers == []
+
+    def test_default_stereotypes_is_empty_list(self):
+        entity = CodeEntity(name="f", file_path="/a.py")
+        assert entity.stereotypes == []
+
+    def test_default_content_hash_is_none(self):
+        entity = CodeEntity(name="f", file_path="/a.py")
+        assert entity.content_hash is None
+
+    def test_default_properties_is_empty_dict(self):
+        entity = CodeEntity(name="f", file_path="/a.py")
+        assert entity.properties == {}
+
 
 class TestCallGraphNode:
     """Tests for CallGraphNode dataclass."""
@@ -97,6 +141,7 @@ class TestCallGraphNode:
             is_endpoint=True,
             entity_type="reference",
             relationship_type="CALLS",
+            truncated=True,
         )
         assert node.name == "caller"
         assert node.file_path == "/src/bar.py"
@@ -108,6 +153,7 @@ class TestCallGraphNode:
         assert node.is_endpoint is True
         assert node.entity_type == "reference"
         assert node.relationship_type == "CALLS"
+        assert node.truncated is True
 
     def test_default_repository_is_none(self):
         node = CallGraphNode(name="n", file_path="/a.py")
@@ -140,6 +186,10 @@ class TestCallGraphNode:
     def test_default_relationship_type_is_call(self):
         node = CallGraphNode(name="n", file_path="/a.py")
         assert node.relationship_type == "CALLS"
+
+    def test_default_truncated_is_false(self):
+        node = CallGraphNode(name="n", file_path="/a.py")
+        assert node.truncated is False
 
 
 class TestFunctionContext:
@@ -425,30 +475,42 @@ class TestFileContext:
             file_path="src/foo.py",
             repository="repo",
             language="Python",
+            content_hash="deadbeef",
             packages=["pkg.core"],
             exports=[export],
             classes=["Foo"],
             interfaces=["Bar"],
             top_level_methods=["foo"],
             hooks=["useState"],
+            constructors=["Foo"],
+            fields=["value"],
+            references=["requests.get"],
         )
         assert context.repository == "repo"
         assert context.language == "Python"
+        assert context.content_hash == "deadbeef"
         assert context.packages == ["pkg.core"]
         assert context.exports == [export]
         assert context.classes == ["Foo"]
         assert context.interfaces == ["Bar"]
         assert context.top_level_methods == ["foo"]
         assert context.hooks == ["useState"]
+        assert context.constructors == ["Foo"]
+        assert context.fields == ["value"]
+        assert context.references == ["requests.get"]
 
     def test_default_list_fields_are_empty(self):
         context = FileContext(name="foo.py", file_path="src/foo.py")
+        assert context.content_hash is None
         assert context.packages == []
         assert context.exports == []
         assert context.classes == []
         assert context.interfaces == []
         assert context.top_level_methods == []
         assert context.hooks == []
+        assert context.constructors == []
+        assert context.fields == []
+        assert context.references == []
 
 
 class TestImpactResult:
@@ -526,3 +588,93 @@ class TestImpactResult:
         assert r2.affected_tests == []
         assert r2.affected_endpoints == []
         assert r2.other_callers == []
+
+
+class TestRepositoryContext:
+    """Tests for RepositoryContext dataclass."""
+
+    def test_required_fields_only(self):
+        context = RepositoryContext(name="repo-a")
+        assert context.name == "repo-a"
+        assert context.entity_count == 0
+
+    def test_all_fields(self):
+        context = RepositoryContext(
+            name="repo-a",
+            source="https://github.com/example/repo-a",
+            entity_count=123,
+            last_indexed_at="2026-03-12T10:00:00+00:00",
+            last_commit_sha="abc123",
+            total_files=20,
+            total_classes=4,
+            total_interfaces=1,
+            total_methods=16,
+            total_constructors=2,
+            total_fields=9,
+            total_packages=3,
+            total_hooks=1,
+            total_references=5,
+            total_exports=7,
+            languages=["Python", "TypeScript"],
+            top_level_classes=["App"],
+            entry_points=["App.main"],
+        )
+        assert context.source == "https://github.com/example/repo-a"
+        assert context.entity_count == 123
+        assert context.last_indexed_at == "2026-03-12T10:00:00+00:00"
+        assert context.last_commit_sha == "abc123"
+        assert context.total_files == 20
+        assert context.total_classes == 4
+        assert context.total_interfaces == 1
+        assert context.total_methods == 16
+        assert context.total_constructors == 2
+        assert context.total_fields == 9
+        assert context.total_packages == 3
+        assert context.total_hooks == 1
+        assert context.total_references == 5
+        assert context.total_exports == 7
+        assert context.languages == ["Python", "TypeScript"]
+        assert context.top_level_classes == ["App"]
+        assert context.entry_points == ["App.main"]
+
+
+class TestPackageContext:
+    """Tests for PackageContext dataclass."""
+
+    def test_required_fields_only(self):
+        context = PackageContext(name="src")
+        assert context.name == "src"
+        assert context.repository is None
+
+    def test_all_fields(self):
+        context = PackageContext(
+            name="src.services",
+            repository="repo-a",
+            package_id="repo-a::src.services",
+            files=["src/services/user.py"],
+            classes=["UserService"],
+            interfaces=["IUserService"],
+            methods=["build_service"],
+            hooks=["useService"],
+            references=["requests.get"],
+            child_packages=["src.services.internal"],
+        )
+        assert context.repository == "repo-a"
+        assert context.package_id == "repo-a::src.services"
+        assert context.files == ["src/services/user.py"]
+        assert context.classes == ["UserService"]
+        assert context.interfaces == ["IUserService"]
+        assert context.methods == ["build_service"]
+        assert context.hooks == ["useService"]
+        assert context.references == ["requests.get"]
+        assert context.child_packages == ["src.services.internal"]
+
+    def test_default_collections_are_empty(self):
+        context = PackageContext(name="src")
+        assert context.files == []
+        assert context.classes == []
+        assert context.interfaces == []
+        assert context.methods == []
+        assert context.hooks == []
+        assert context.references == []
+        assert context.child_packages == []

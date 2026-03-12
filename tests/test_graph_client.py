@@ -13,6 +13,8 @@ from telescope.models import (
     FileContext,
     FunctionContext,
     ImpactResult,
+    PackageContext,
+    RepositoryContext,
 )
 
 
@@ -220,9 +222,17 @@ def _make_search_result(
     signature="def foo()",
     entity_type="method",
     score=0.95,
+    entity_id=None,
+    language=None,
+    return_type=None,
+    modifiers=None,
+    stereotypes=None,
+    content_hash=None,
+    properties=None,
 ):
     """Helper to build a mock Neo4j result dict for search_code."""
     return {
+        "id": entity_id,
         "name": name,
         "file_path": file_path,
         "repository": repository,
@@ -232,6 +242,12 @@ def _make_search_result(
         "signature": signature,
         "entity_type": entity_type,
         "score": score,
+        "language": language,
+        "return_type": return_type,
+        "modifiers": modifiers if modifiers is not None else [],
+        "stereotypes": stereotypes if stereotypes is not None else [],
+        "content_hash": content_hash,
+        "properties": properties if properties is not None else {},
     }
 
 
@@ -298,6 +314,25 @@ class TestSearchCode:
         assert "n.file_path =~ $file_regex" in cypher_arg
         assert graph_client._query.call_args.kwargs["file_regex"] == "^.*Service\\.java.*$"
 
+    async def test_search_code_applies_language_and_stereotype_filters(self, graph_client):
+        """Language and stereotype filters should be pushed into vector search."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        graph_client._query = AsyncMock(return_value=[])
+
+        await graph_client.search_code(
+            "auth",
+            entity_type="method",
+            language="Python",
+            stereotype="endpoint",
+        )
+
+        cypher_arg = graph_client._query.call_args[0][0]
+        kwargs = graph_client._query.call_args.kwargs
+        assert "n.language = $language" in cypher_arg
+        assert "$stereotype IN coalesce(n.stereotypes, [])" in cypher_arg
+        assert kwargs["language"] == "Python"
+        assert kwargs["stereotype"] == "endpoint"
+
     async def test_search_code_maps_line_number_to_line_start(self, graph_client):
         """Verify line_number from Neo4j result maps to line_start on CodeEntity."""
         graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
@@ -307,6 +342,31 @@ class TestSearchCode:
         assert len(results) == 1
         assert results[0].line_start == 42
         assert results[0].line_end == 50
+
+    async def test_search_code_maps_richer_entity_metadata(self, graph_client):
+        """Semantic search should preserve Constellation metadata fields."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        graph_client._query = AsyncMock(return_value=[
+            _make_search_result(
+                entity_id="repo::module.foo",
+                language="Python",
+                return_type="None",
+                modifiers=["async"],
+                stereotypes=["endpoint"],
+                content_hash="deadbeef",
+                properties={"visibility": "public"},
+            )
+        ])
+
+        results = await graph_client.search_code("auth", entity_type="method")
+
+        assert results[0].entity_id == "repo::module.foo"
+        assert results[0].language == "Python"
+        assert results[0].return_type == "None"
+        assert results[0].modifiers == ["async"]
+        assert results[0].stereotypes == ["endpoint"]
+        assert results[0].content_hash == "deadbeef"
+        assert results[0].properties == {"visibility": "public"}
 
     async def test_search_code_code_mode_none(self, graph_client):
         """Verify code=None when code_mode='none'."""
@@ -377,6 +437,46 @@ class TestSearchCode:
         results = await graph_client.search_code("auth", limit=5)
         assert len(results) == 5
 
+    async def test_search_code_uses_hybrid_symbol_results_for_symbol_queries(self, graph_client):
+        """Identifier-like queries should merge exact symbol hits ahead of semantic hits."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        graph_client._query = AsyncMock(side_effect=[[ _make_search_result(name="semantic", entity_id="repo::semantic") ]])
+        graph_client.find_symbols = AsyncMock(side_effect=[
+            [
+                CodeEntity(
+                    name="useState",
+                    file_path="src/App.tsx",
+                    repository="repo",
+                    entity_id="repo::src/App.tsx::useState",
+                    entity_type="hook",
+                )
+            ],
+        ])
+
+        results = await graph_client.search_code("useState", entity_type="method", limit=5)
+
+        graph_client.find_symbols.assert_awaited_once_with(
+            "useState",
+            entity_types=["method"],
+            repository=None,
+            file_pattern=None,
+            limit=5,
+            exact=True,
+            language=None,
+            stereotype=None,
+        )
+        assert [result.name for result in results] == ["useState", "semantic"]
+
+    async def test_search_code_skips_hybrid_lookup_for_natural_language_queries(self, graph_client):
+        """Natural-language queries should remain semantic-only."""
+        graph_client._get_embedding = AsyncMock(return_value=[0.1] * 1536)
+        graph_client._query = AsyncMock(side_effect=[[]] * 4)
+        graph_client.find_symbols = AsyncMock(return_value=[])
+
+        await graph_client.search_code("payment processing")
+
+        graph_client.find_symbols.assert_not_awaited()
+
 
 class TestGetCallers:
     """Tests for GraphClient.get_callers()."""
@@ -411,6 +511,20 @@ class TestGetCallers:
         assert "IMPLEMENTS" in cypher_arg
         assert "EXTENDS" in cypher_arg
         assert "OVERRIDES" not in cypher_arg
+
+    async def test_get_callers_uses_parameter_suffix_when_entity_id_is_java_style(self, graph_client):
+        """Resolved Java methods should constrain family expansion by parameter signature."""
+        graph_client._query = AsyncMock(return_value=[])
+
+        await graph_client.get_callers(
+            "save",
+            entity_id="repo::com.example.Service.save(String,int)",
+        )
+
+        cypher_arg = graph_client._query.call_args[0][0]
+        kwargs = graph_client._query.call_args.kwargs
+        assert "candidate_method.id ENDS WITH (candidate_method.name + $parameter_suffix)" in cypher_arg
+        assert kwargs["parameter_suffix"] == "(String,int)"
 
     async def test_get_callers_preserves_top_level_functions(self, graph_client):
         """Top-level functions should stay queryable even without a class owner."""
@@ -455,6 +569,21 @@ class TestGetCallers:
         graph_client._query = AsyncMock(return_value=[])
         results = await graph_client.get_callers("unusedMethod")
         assert results == []
+
+    async def test_get_callers_uses_limit_and_marks_truncation(self, graph_client):
+        """Caller traversal should honor caller limits and mark truncated results."""
+        graph_client._query = AsyncMock(return_value=[
+            {"name": "caller1", "file_path": "src/a.py", "line_number": 1},
+            {"name": "caller2", "file_path": "src/b.py", "line_number": 2},
+            {"name": "caller3", "file_path": "src/c.py", "line_number": 3},
+        ])
+
+        results = await graph_client.get_callers("targetMethod", limit=2)
+
+        kwargs = graph_client._query.call_args.kwargs
+        assert kwargs["query_limit"] == 3
+        assert [result.name for result in results] == ["caller1", "caller2"]
+        assert all(result.truncated is True for result in results)
 
 
 class TestGetCallees:
@@ -513,6 +642,20 @@ class TestGetCallees:
         assert "EXTENDS" in cypher_arg
         assert "OVERRIDES" not in cypher_arg
 
+    async def test_get_callees_uses_parameter_suffix_when_entity_id_is_java_style(self, graph_client):
+        """Resolved Java methods should constrain callee family expansion by parameter signature."""
+        graph_client._query = AsyncMock(side_effect=[[], []])
+
+        await graph_client.get_callees(
+            "save",
+            entity_id="repo::com.example.Service.save(String,int)",
+        )
+
+        cypher_arg = graph_client._query.call_args_list[0][0][0]
+        kwargs = graph_client._query.call_args_list[0].kwargs
+        assert "candidate_method.id ENDS WITH (candidate_method.name + $parameter_suffix)" in cypher_arg
+        assert kwargs["parameter_suffix"] == "(String,int)"
+
     async def test_get_callees_depth_clamped_to_3(self, graph_client):
         """Passing depth=10 results in CALLS*1..3 in Cypher."""
         graph_client._query = AsyncMock(side_effect=[[], []])
@@ -568,6 +711,24 @@ class TestGetCallees:
         assert results[0].name == "useState"
         assert results[0].entity_type == "hook"
         assert results[0].relationship_type == "USES_HOOK"
+
+    async def test_get_callees_uses_limit_and_marks_truncation(self, graph_client):
+        """Callee traversal should honor the merged result limit and mark truncation."""
+        graph_client._query = AsyncMock(side_effect=[
+            [
+                {"name": "callee1", "file_path": "src/a.py", "line_number": 1, "entity_type": "Method", "relationship_type": "CALLS", "depth": 1},
+                {"name": "callee2", "file_path": "src/b.py", "line_number": 2, "entity_type": "Method", "relationship_type": "CALLS", "depth": 1},
+                {"name": "callee3", "file_path": "src/c.py", "line_number": 3, "entity_type": "Method", "relationship_type": "CALLS", "depth": 1},
+            ],
+            [],
+        ])
+
+        results = await graph_client.get_callees("sourceMethod", limit=2)
+
+        kwargs = graph_client._query.call_args_list[0].kwargs
+        assert kwargs["query_limit"] == 3
+        assert [result.name for result in results] == ["callee1", "callee2"]
+        assert all(result.truncated is True for result in results)
 
 
 def _make_function_context_result(
@@ -901,6 +1062,133 @@ class TestListRepositories:
         graph_client._query = AsyncMock(return_value=[])
         results = await graph_client.list_repositories()
         assert results == []
+
+
+class TestGetRepositoryContext:
+    """Tests for GraphClient.get_repository_context()."""
+
+    async def test_get_repository_context_returns_repository_metadata(self, graph_client):
+        graph_client._query = AsyncMock(side_effect=[
+            [{
+                "name": "repo-a",
+                "source": "https://github.com/example/repo-a",
+                "entity_count": 123,
+                "last_indexed_at": "2026-03-12T10:00:00+00:00",
+                "last_commit_sha": "abc123",
+            }],
+            [{
+                "files": 20,
+                "classes": 4,
+                "interfaces": 1,
+                "methods": 16,
+                "constructors": 2,
+                "fields": 9,
+                "packages_count": 3,
+                "hooks": 1,
+                "references": 5,
+                "exports": 7,
+                "languages": ["Python", "TypeScript"],
+                "packages": ["src", "src.services"],
+            }],
+            [{"name": "App"}],
+            [{"name": "main", "class_name": "App"}],
+        ])
+
+        result = await graph_client.get_repository_context("repo-a")
+
+        assert isinstance(result, RepositoryContext)
+        assert result.name == "repo-a"
+        assert result.source == "https://github.com/example/repo-a"
+        assert result.entity_count == 123
+        assert result.last_indexed_at == "2026-03-12T10:00:00+00:00"
+        assert result.last_commit_sha == "abc123"
+        assert result.total_files == 20
+        assert result.total_classes == 4
+        assert result.total_interfaces == 1
+        assert result.total_methods == 16
+        assert result.total_constructors == 2
+        assert result.total_fields == 9
+        assert result.total_packages == 3
+        assert result.total_hooks == 1
+        assert result.total_references == 5
+        assert result.total_exports == 7
+        assert result.languages == ["Python", "TypeScript"]
+        assert result.top_level_classes == ["App"]
+        assert result.entry_points == ["App.main"]
+
+    async def test_get_repository_context_returns_none_when_missing(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[])
+
+        result = await graph_client.get_repository_context("missing")
+
+        assert result is None
+        assert graph_client._query.await_count == 1
+
+
+class TestGetPackageContext:
+    """Tests for GraphClient.get_package_context()."""
+
+    async def test_get_package_context_returns_package_members(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "name": "src.services",
+                "id": "repo-a::src.services",
+                "repository": "repo-a",
+                "files": ["src/services/user.py"],
+                "classes": ["UserService"],
+                "interfaces": ["IUserService"],
+                "methods": ["build_service"],
+                "hooks": ["useService"],
+                "references": ["requests.get"],
+                "child_packages": ["src.services.internal"],
+            }
+        ])
+
+        result = await graph_client.get_package_context("src.services", repository="repo-a")
+
+        assert isinstance(result, PackageContext)
+        assert result.name == "src.services"
+        assert result.package_id == "repo-a::src.services"
+        assert result.repository == "repo-a"
+        assert result.files == ["src/services/user.py"]
+        assert result.classes == ["UserService"]
+        assert result.interfaces == ["IUserService"]
+        assert result.methods == ["build_service"]
+        assert result.hooks == ["useService"]
+        assert result.references == ["requests.get"]
+        assert result.child_packages == ["src.services.internal"]
+
+    async def test_get_package_context_uses_member_file_paths_when_file_edges_are_missing(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "name": "com.example",
+                "id": "repo-a::com.example",
+                "repository": "repo-a",
+                "files": ["src/java/com/example/Service.java"],
+                "classes": ["Service"],
+                "interfaces": [],
+                "methods": ["run", "helper"],
+                "hooks": [],
+                "references": [],
+                "child_packages": [],
+            }
+        ])
+
+        result = await graph_client.get_package_context("com.example", repository="repo-a")
+
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "collect(DISTINCT member.file_path) AS files" in cypher_arg
+        assert result is not None
+        assert result.files == ["src/java/com/example/Service.java"]
+
+    async def test_get_package_context_raises_on_ambiguous_match(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[
+            {"name": "src.services", "id": "repo-a::src.services", "repository": "repo-a"},
+            {"name": "src.services", "id": "repo-b::src.services", "repository": "repo-b"},
+        ])
+
+        with pytest.raises(ValueError, match="ambiguous"):
+            await graph_client.get_package_context("src.services")
 
 
 class TestGetCodebaseOverview:
@@ -1336,6 +1624,20 @@ class TestGetImpact:
         assert "EXTENDS" in callers_cypher
         assert "OVERRIDES" not in callers_cypher
 
+    async def test_get_impact_uses_parameter_suffix_for_java_methods(self, graph_client):
+        """Impact analysis should avoid over-merging Java overloads across type families."""
+        graph_client._query = AsyncMock(side_effect=[
+            [_make_impact_target(entity_id="repo::com.example.Service.save(String,int)")],
+            [],
+        ])
+
+        await graph_client.get_impact("save")
+
+        callers_cypher = graph_client._query.call_args_list[1][0][0]
+        kwargs = graph_client._query.call_args_list[1].kwargs
+        assert "candidate_method.id ENDS WITH (candidate_method.name + $parameter_suffix)" in callers_cypher
+        assert kwargs["parameter_suffix"] == "(String,int)"
+
 
 class TestFindSymbols:
     """Tests for GraphClient.find_symbols()."""
@@ -1357,9 +1659,27 @@ class TestFindSymbols:
         assert "n.file_path =~ $file_regex" in cypher_arg
         assert kwargs["file_regex"] == "^.*/api/.*$"
 
+    async def test_find_symbols_applies_language_and_stereotype_filters(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[])
+
+        await graph_client.find_symbols(
+            "Auth",
+            repository="repo",
+            language="Python",
+            stereotype="test",
+        )
+
+        cypher_arg = graph_client._query.call_args[0][0]
+        kwargs = graph_client._query.call_args.kwargs
+        assert "n.language = $language" in cypher_arg
+        assert "$stereotype IN coalesce(n.stereotypes, [])" in cypher_arg
+        assert kwargs["language"] == "Python"
+        assert kwargs["stereotype"] == "test"
+
     async def test_find_symbols_maps_results(self, graph_client):
         graph_client._query = AsyncMock(return_value=[
             {
+                "id": "repo::src/App.tsx::useState",
                 "name": "useState",
                 "file_path": "src/App.tsx",
                 "repository": "repo",
@@ -1368,13 +1688,64 @@ class TestFindSymbols:
                 "signature": None,
                 "code": None,
                 "entity_type": "Hook",
+                "language": "TypeScript",
+                "return_type": None,
+                "modifiers": [],
+                "stereotypes": [],
+                "content_hash": "deadbeef",
+                "properties": {"symbol": "useState"},
             },
         ])
         results = await graph_client.find_symbols("useState", entity_types=["hook"])
         assert len(results) == 1
         assert isinstance(results[0], CodeEntity)
+        assert results[0].entity_id == "repo::src/App.tsx::useState"
         assert results[0].entity_type == "hook"
         assert results[0].line_start == 12
+        assert results[0].language == "TypeScript"
+        assert results[0].content_hash == "deadbeef"
+        assert results[0].properties == {"symbol": "useState"}
+
+    async def test_find_symbols_maps_results_with_null_list_fields(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "id": "repo::ref:client.fetch",
+                "name": "client.fetch",
+                "file_path": "src/service.java",
+                "repository": "repo",
+                "line_number": 19,
+                "line_end": None,
+                "signature": None,
+                "code": None,
+                "entity_type": "Reference",
+                "language": "Java",
+                "return_type": None,
+                "modifiers": None,
+                "stereotypes": None,
+                "content_hash": None,
+                "properties": {"symbol": "client.fetch"},
+            },
+        ])
+
+        results = await graph_client.find_symbols("client.fetch", entity_types=["reference"], exact=True)
+
+        assert len(results) == 1
+        assert results[0].entity_type == "reference"
+        assert results[0].modifiers == []
+        assert results[0].stereotypes == []
+        assert results[0].properties == {"symbol": "client.fetch"}
+
+    async def test_find_symbols_avoids_reserved_query_parameter_name(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[])
+
+        await graph_client.find_symbols("helper", repository="repo", exact=True)
+
+        kwargs = graph_client._query.call_args.kwargs
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "toLower(n.name) = toLower($search_query)" in cypher_arg
+        assert "CASE\n                         WHEN toLower(n.name) = toLower($search_query)" in cypher_arg
+        assert kwargs["search_query"] == "helper"
+        assert "query" not in kwargs
 
 
 class TestGetFileContext:
@@ -1382,24 +1753,39 @@ class TestGetFileContext:
 
     async def test_get_file_context_returns_file_details(self, graph_client):
         graph_client._query = AsyncMock(side_effect=[
-            [{"name": "App.tsx", "file_path": "src/App.tsx", "repository": "repo", "language": "TypeScript"}],
             [{
                 "name": "App.tsx",
                 "file_path": "src/App.tsx",
                 "repository": "repo",
                 "language": "TypeScript",
+                "content_hash": "deadbeef",
+            }],
+            [{
+                "name": "App.tsx",
+                "file_path": "src/App.tsx",
+                "repository": "repo",
+                "language": "TypeScript",
+                "content_hash": "deadbeef",
                 "packages": ["src.components"],
                 "classes": ["App"],
                 "interfaces": ["Props"],
                 "top_level_methods": ["renderApp"],
                 "hooks": ["useState"],
+                "constructors": ["App"],
+                "fields": ["title"],
+                "references": ["React.Fragment"],
                 "exports": [
                     {
+                        "id": "repo::src/App.tsx::App",
                         "name": "App",
                         "file_path": "src/App.tsx",
                         "repository": "repo",
                         "line_start": 3,
+                        "line_end": 40,
                         "entity_type": "class",
+                        "language": "TypeScript",
+                        "content_hash": "deadbeef",
+                        "properties": {"export_type": "default"},
                     },
                 ],
             }],
@@ -1408,12 +1794,19 @@ class TestGetFileContext:
         assert isinstance(result, FileContext)
         assert result.file_path == "src/App.tsx"
         assert result.language == "TypeScript"
+        assert result.content_hash == "deadbeef"
         assert result.packages == ["src.components"]
         assert result.classes == ["App"]
         assert result.interfaces == ["Props"]
         assert result.top_level_methods == ["renderApp"]
         assert result.hooks == ["useState"]
+        assert result.constructors == ["App"]
+        assert result.fields == ["title"]
+        assert result.references == ["React.Fragment"]
         assert result.exports[0].name == "App"
+        assert result.exports[0].entity_id == "repo::src/App.tsx::App"
+        assert result.exports[0].content_hash == "deadbeef"
+        assert result.exports[0].properties == {"export_type": "default"}
 
     async def test_get_file_context_raises_on_ambiguous_match(self, graph_client):
         graph_client._query = AsyncMock(return_value=[
@@ -1454,3 +1847,34 @@ class TestGetHookUsage:
         assert "m.repository = $repository" in cypher_arg
         assert "m.file_path =~ $file_regex" in cypher_arg
         assert kwargs["file_regex"] == "^.*/ui/.*$"
+
+    async def test_get_hook_usage_applies_language_and_stereotype_filters(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[])
+
+        await graph_client.get_hook_usage(
+            "useEffect",
+            repository="repo",
+            language="TypeScript",
+            stereotype="test",
+        )
+
+        cypher_arg = graph_client._query.call_args[0][0]
+        kwargs = graph_client._query.call_args.kwargs
+        assert "m.language = $language" in cypher_arg
+        assert "$stereotype IN coalesce(m.stereotypes, [])" in cypher_arg
+        assert kwargs["language"] == "TypeScript"
+        assert kwargs["stereotype"] == "test"
+
+    async def test_get_hook_usage_uses_limit_and_marks_truncation(self, graph_client):
+        graph_client._query = AsyncMock(return_value=[
+            {"name": "render1", "file_path": "src/A.tsx", "line_number": 1, "entity_type": "Method", "relationship_type": "USES_HOOK"},
+            {"name": "render2", "file_path": "src/B.tsx", "line_number": 2, "entity_type": "Method", "relationship_type": "USES_HOOK"},
+            {"name": "render3", "file_path": "src/C.tsx", "line_number": 3, "entity_type": "Method", "relationship_type": "USES_HOOK"},
+        ])
+
+        results = await graph_client.get_hook_usage("useState", limit=2)
+
+        kwargs = graph_client._query.call_args.kwargs
+        assert kwargs["query_limit"] == 3
+        assert [result.name for result in results] == ["render1", "render2"]
+        assert all(result.truncated is True for result in results)

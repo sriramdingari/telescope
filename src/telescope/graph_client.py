@@ -16,6 +16,8 @@ from .models import (
     FileContext,
     FunctionContext,
     ImpactResult,
+    PackageContext,
+    RepositoryContext,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,23 @@ SYMBOL_ENTITY_TYPE_TO_LABEL = {
 FILTERED_SEARCH_MIN_CANDIDATES = 100
 FILTERED_SEARCH_CANDIDATE_MULTIPLIER = 25
 FILTERED_SEARCH_MAX_CANDIDATES = 5000
+ENTITY_RESERVED_PROPERTIES = {
+    "id",
+    "name",
+    "repository",
+    "file_path",
+    "line_number",
+    "line_end",
+    "language",
+    "code",
+    "signature",
+    "return_type",
+    "docstring",
+    "modifiers",
+    "stereotypes",
+    "content_hash",
+    "embedding",
+}
 
 
 class GraphClient:
@@ -142,6 +161,8 @@ class GraphClient:
         alias: str,
         repository: str | None = None,
         file_pattern: str | None = None,
+        language: str | None = None,
+        stereotype: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Build parameterized filters for repository and wildcard file matches."""
         filters: list[str] = []
@@ -155,11 +176,34 @@ class GraphClient:
             filters.append(f"{alias}.file_path =~ $file_regex")
             params["file_regex"] = self._file_pattern_to_regex(file_pattern)
 
+        if language:
+            filters.append(f"{alias}.language = $language")
+            params["language"] = language
+
+        if stereotype:
+            filters.append(f"$stereotype IN coalesce({alias}.stereotypes, [])")
+            params["stereotype"] = stereotype
+
         clause = ""
         if filters:
             clause = " AND " + " AND ".join(filters)
 
         return clause, params
+
+    @staticmethod
+    def _clamp_result_limit(limit: int, maximum: int = 200) -> int:
+        """Clamp user-provided result limits to a safe positive range."""
+        return max(1, min(limit, maximum))
+
+    @staticmethod
+    def _looks_like_symbol_query(query: str) -> bool:
+        """Heuristic to decide whether a query should blend in symbol search."""
+        stripped = query.strip()
+        if not stripped or " " in stripped:
+            return False
+        if any(token in stripped for token in ("/", ".", "::", "_", "-")):
+            return True
+        return any(char.isupper() for char in stripped[1:])
 
     def _build_method_match(
         self,
@@ -234,6 +278,8 @@ class GraphClient:
         embedding: list[float],
         repository: str | None = None,
         file_pattern: str | None = None,
+        language: str | None = None,
+        stereotype: str | None = None,
     ) -> list[dict]:
         """Search a single entity type, using exact filtered scoring when available."""
         label = ENTITY_TYPE_TO_LABEL[entity_type]
@@ -241,13 +287,19 @@ class GraphClient:
             "n",
             repository=repository,
             file_pattern=file_pattern,
+            language=language,
+            stereotype=stereotype,
         )
 
         return_clause = f"""
-            RETURN n.name AS name, n.file_path AS file_path,
+            RETURN n.id AS id, n.name AS name, n.file_path AS file_path,
                    n.repository AS repository,
                    n.line_number AS line_number, n.line_end AS line_end,
                    n.code AS code, n.signature AS signature,
+                   n.language AS language, n.return_type AS return_type,
+                   n.modifiers AS modifiers, n.stereotypes AS stereotypes,
+                   n.content_hash AS content_hash,
+                   properties(n) AS properties,
                    '{entity_type}' AS entity_type, score
             ORDER BY score DESC
             LIMIT $limit
@@ -346,11 +398,54 @@ class GraphClient:
         return fallback_name
 
     @staticmethod
+    def _parameter_suffix_from_entity_id(entity_id: str | None) -> str | None:
+        """Extract a trailing Java-style parameter signature suffix from an entity id."""
+        if not entity_id or not entity_id.endswith(")"):
+            return None
+        open_paren = entity_id.rfind("(")
+        if open_paren == -1:
+            return None
+        return entity_id[open_paren:]
+
+    @staticmethod
     def _label_to_entity_type(label: str | None) -> str:
         """Normalize a Neo4j label into Telescope's lowercase entity type names."""
         if not label:
             return "method"
         return label.lower()
+
+    @staticmethod
+    def _custom_entity_properties(properties: dict[str, Any] | None) -> dict[str, Any]:
+        """Return only non-core graph properties for an entity."""
+        if not properties:
+            return {}
+        return {
+            key: value
+            for key, value in properties.items()
+            if key not in ENTITY_RESERVED_PROPERTIES and value is not None
+        }
+
+    def _entity_from_record(self, record: dict[str, Any]) -> CodeEntity:
+        """Build a CodeEntity from a Neo4j record."""
+        return CodeEntity(
+            name=record["name"],
+            file_path=record.get("file_path") or "",
+            repository=record.get("repository"),
+            entity_id=record.get("id"),
+            line_start=record.get("line_number") or record.get("line_start"),
+            line_end=record.get("line_end"),
+            code=record.get("code"),
+            signature=record.get("signature"),
+            docstring=record.get("docstring"),
+            score=record.get("score", 0.0),
+            entity_type=self._label_to_entity_type(record.get("entity_type")),
+            language=record.get("language"),
+            return_type=record.get("return_type"),
+            modifiers=[value for value in (record.get("modifiers") or []) if value],
+            stereotypes=[value for value in (record.get("stereotypes") or []) if value],
+            content_hash=record.get("content_hash"),
+            properties=self._custom_entity_properties(record.get("properties")),
+        )
 
     def _method_family_fragment(self, alias: str) -> str:
         """Build a method-family expansion based on class/interface relationships."""
@@ -369,6 +464,8 @@ class GraphClient:
             END AS candidate_owner
             OPTIONAL MATCH (candidate_owner)-[:HAS_METHOD|HAS_CONSTRUCTOR]->(candidate_method)
             WHERE candidate_method.name = {alias}.name
+              AND ($parameter_suffix IS NULL
+                   OR candidate_method.id ENDS WITH (candidate_method.name + $parameter_suffix))
             WITH {alias}, collect(DISTINCT candidate_method) + [{alias}] AS all_methods
             UNWIND all_methods AS method
             WITH DISTINCT method, {alias}
@@ -414,8 +511,11 @@ class GraphClient:
         file_pattern: str | None = None,
         repository: str | None = None,
         code_mode: str = "preview",
+        language: str | None = None,
+        stereotype: str | None = None,
     ) -> list[CodeEntity]:
         """Semantic search for code using vector similarity."""
+        limit = self._clamp_result_limit(limit, maximum=20)
         embedding = await self._get_embedding(query)
 
         if entity_type:
@@ -437,6 +537,8 @@ class GraphClient:
                 embedding=embedding,
                 repository=repository,
                 file_pattern=file_pattern,
+                language=language,
+                stereotype=stereotype,
             )
             all_results.extend(results)
 
@@ -457,20 +559,54 @@ class GraphClient:
                 return "\n".join(lines[:10]) + "\n... (truncated)"
             return code
 
-        return [
-            CodeEntity(
-                name=r["name"],
-                file_path=r["file_path"] or "",
-                repository=r.get("repository"),
-                line_start=r.get("line_number"),
-                line_end=r.get("line_end"),
-                code=process_code(r.get("code"), r.get("signature")),
-                signature=r.get("signature"),
-                score=r.get("score", 0),
-                entity_type=r.get("entity_type", "method"),
+        entities: list[CodeEntity] = []
+        for record in results:
+            entity = self._entity_from_record(record)
+            entity.code = process_code(record.get("code"), record.get("signature"))
+            entities.append(entity)
+
+        if self._looks_like_symbol_query(query):
+            symbol_results = await self.find_symbols(
+                query,
+                entity_types=[entity_type] if entity_type else None,
+                repository=repository,
+                file_pattern=file_pattern,
+                limit=limit,
+                exact=True,
+                language=language,
+                stereotype=stereotype,
             )
-            for r in results
-        ]
+            if not symbol_results:
+                symbol_results = await self.find_symbols(
+                    query,
+                    entity_types=[entity_type] if entity_type else None,
+                    repository=repository,
+                    file_pattern=file_pattern,
+                    limit=limit,
+                    exact=False,
+                    language=language,
+                    stereotype=stereotype,
+                )
+
+            merged: list[CodeEntity] = []
+            seen: set[tuple[str | None, str, str, str]] = set()
+            for entity in symbol_results + entities:
+                entity.code = process_code(entity.code, entity.signature)
+                key = (
+                    entity.entity_id,
+                    entity.entity_type,
+                    entity.file_path,
+                    entity.name,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(entity)
+                if len(merged) >= limit:
+                    break
+            return merged
+
+        return entities
 
     async def get_callers(
         self,
@@ -479,9 +615,11 @@ class GraphClient:
         file_path: str | None = None,
         depth: int = 1,
         entity_id: str | None = None,
+        limit: int = 50,
     ) -> list[CallGraphNode]:
         """Find callers of a method using the current Constellation graph schema."""
         depth = min(depth, 3)
+        limit = self._clamp_result_limit(limit)
         match_clause, params = self._build_method_match(
             "m",
             method_name=method_name,
@@ -489,6 +627,7 @@ class GraphClient:
             file_path=file_path,
             entity_id=entity_id,
         )
+        params["parameter_suffix"] = self._parameter_suffix_from_entity_id(entity_id)
 
         cypher = f"""
             {match_clause}
@@ -500,10 +639,12 @@ class GraphClient:
                    caller.signature AS signature, caller.line_number AS line_number,
                    head(labels(caller)) AS entity_type, 'CALLS' AS relationship_type
             ORDER BY caller.file_path, caller.line_number
-            LIMIT 50
+            LIMIT $query_limit
         """
 
-        results = await self._query(cypher, **params)
+        results = await self._query(cypher, query_limit=limit + 1, **params)
+        truncated = len(results) > limit
+        results = results[:limit]
 
         return [
             CallGraphNode(
@@ -514,6 +655,7 @@ class GraphClient:
                 line_start=r.get("line_number"),
                 entity_type=self._label_to_entity_type(r.get("entity_type")),
                 relationship_type=r.get("relationship_type", "CALLS"),
+                truncated=truncated,
             )
             for r in results
         ]
@@ -525,9 +667,11 @@ class GraphClient:
         file_path: str | None = None,
         depth: int = 1,
         entity_id: str | None = None,
+        limit: int = 50,
     ) -> list[CallGraphNode]:
         """Find call targets and hook usage for a method."""
         depth = min(depth, 3)
+        limit = self._clamp_result_limit(limit)
         match_clause, params = self._build_method_match(
             "m",
             method_name=method_name,
@@ -535,6 +679,7 @@ class GraphClient:
             file_path=file_path,
             entity_id=entity_id,
         )
+        params["parameter_suffix"] = self._parameter_suffix_from_entity_id(entity_id)
 
         calls_cypher = f"""
             {match_clause}
@@ -548,7 +693,7 @@ class GraphClient:
                    head(labels(callee)) AS entity_type, 'CALLS' AS relationship_type,
                    depth
             ORDER BY depth, callee.file_path, callee.line_number
-            LIMIT 50
+            LIMIT $query_limit
         """
 
         hooks_cypher = f"""
@@ -561,11 +706,11 @@ class GraphClient:
                    'Hook' AS entity_type, 'USES_HOOK' AS relationship_type,
                    1 AS depth
             ORDER BY hook.file_path, hook.line_number
-            LIMIT 50
+            LIMIT $query_limit
         """
 
-        call_results = await self._query(calls_cypher, **params)
-        hook_results = await self._query(hooks_cypher, **params)
+        call_results = await self._query(calls_cypher, query_limit=limit + 1, **params)
+        hook_results = await self._query(hooks_cypher, query_limit=limit + 1, **params)
         combined: dict[tuple[str, str], dict] = {}
         for row in call_results + hook_results:
             key = (
@@ -584,7 +729,9 @@ class GraphClient:
                 row.get("line_number") or 0,
                 row.get("name") or "",
             ),
-        )[:50]
+        )
+        truncated = len(results) > limit or len(call_results) > limit or len(hook_results) > limit
+        results = results[:limit]
 
         return [
             CallGraphNode(
@@ -596,6 +743,7 @@ class GraphClient:
                 depth=r.get("depth", 1),
                 entity_type=self._label_to_entity_type(r.get("entity_type")),
                 relationship_type=r.get("relationship_type", "CALLS"),
+                truncated=truncated,
             )
             for r in results
         ]
@@ -720,6 +868,121 @@ class GraphClient:
             ORDER BY r.name
         """
         return await self._query(cypher)
+
+    async def get_repository_context(self, repository: str) -> RepositoryContext | None:
+        """Fetch repository metadata and aggregate graph statistics."""
+        cypher = """
+            MATCH (r:Repository {name: $repository})
+            RETURN r.name AS name, r.source AS source,
+                   r.entity_count AS entity_count,
+                   r.last_indexed_at AS last_indexed_at,
+                   r.last_commit_sha AS last_commit_sha
+        """
+        rows = await self._query(cypher, repository=repository)
+        if not rows:
+            return None
+
+        row = rows[0]
+        overview = await self.get_codebase_overview(repository=repository)
+        return RepositoryContext(
+            name=row["name"],
+            source=row.get("source"),
+            entity_count=row.get("entity_count", 0),
+            last_indexed_at=row.get("last_indexed_at"),
+            last_commit_sha=row.get("last_commit_sha"),
+            total_files=overview.total_files,
+            total_classes=overview.total_classes,
+            total_interfaces=overview.total_interfaces,
+            total_methods=overview.total_methods,
+            total_constructors=overview.total_constructors,
+            total_fields=overview.total_fields,
+            total_packages=overview.total_packages,
+            total_hooks=overview.total_hooks,
+            total_references=overview.total_references,
+            total_exports=overview.total_exports,
+            languages=overview.languages,
+            top_level_classes=overview.top_level_classes,
+            entry_points=overview.entry_points,
+        )
+
+    async def get_package_context(
+        self,
+        package_name: str,
+        repository: str | None = None,
+    ) -> PackageContext | None:
+        """Return package or namespace membership information."""
+        filters = ["(pkg.name = $package_name OR pkg.id ENDS WITH $package_id_suffix)"]
+        params: dict[str, Any] = {
+            "package_name": package_name,
+            "package_id_suffix": f"::{package_name}",
+        }
+        if repository:
+            filters.append("pkg.repository = $repository")
+            params["repository"] = repository
+
+        cypher = f"""
+            MATCH (pkg:Package)
+            WHERE {" AND ".join(filters)}
+            OPTIONAL MATCH (member)-[:IN_PACKAGE]->(pkg)
+            WITH pkg, collect(DISTINCT member.file_path) AS files
+            OPTIONAL MATCH (class:Class)-[:IN_PACKAGE]->(pkg)
+            WITH pkg, files, collect(DISTINCT class.name) AS classes
+            OPTIONAL MATCH (iface:Interface)-[:IN_PACKAGE]->(pkg)
+            WITH pkg, files, classes, collect(DISTINCT iface.name) AS interfaces
+            OPTIONAL MATCH (method:Method)-[:IN_PACKAGE]->(pkg)
+            WITH pkg, files, classes, interfaces, collect(DISTINCT method.name) AS methods
+            OPTIONAL MATCH (hook:Hook)-[:IN_PACKAGE]->(pkg)
+            WITH pkg, files, classes, interfaces, methods, collect(DISTINCT hook.name) AS hooks
+            OPTIONAL MATCH (ref:Reference)-[:IN_PACKAGE]->(pkg)
+            WITH pkg, files, classes, interfaces, methods, hooks,
+                 collect(DISTINCT ref.name) AS references
+            OPTIONAL MATCH (child:Package {{repository: pkg.repository}})
+            WHERE child.id STARTS WITH pkg.id + '.'
+            RETURN pkg.name AS name, pkg.id AS id, pkg.repository AS repository,
+                   files, classes, interfaces, methods, hooks, references,
+                   collect(DISTINCT {{id: child.id, name: child.name}}) AS child_packages
+            ORDER BY pkg.repository, pkg.id
+            LIMIT 2
+        """
+        rows = await self._query(cypher, **params)
+        if not rows:
+            return None
+        if len(rows) > 1:
+            examples = ", ".join(
+                self._full_name_from_id(row.get("id") or "", row.get("name") or "?")
+                for row in rows
+            )
+            raise ValueError(
+                f"Package '{package_name}' is ambiguous for the current filters. Matching entries: {examples}"
+            )
+
+        row = rows[0]
+        full_name = self._full_name_from_id(row.get("id") or "", row.get("name") or package_name)
+        base_segments = full_name.split(".")
+        child_packages = []
+        for child in row.get("child_packages", []):
+            if isinstance(child, str):
+                child_name = child
+            else:
+                child_name = self._full_name_from_id(child.get("id") or "", child.get("name") or "")
+            if not child_name.startswith(full_name + "."):
+                continue
+            if len(child_name.split(".")) != len(base_segments) + 1:
+                continue
+            child_packages.append(child_name)
+
+        return PackageContext(
+            name=full_name,
+            repository=row.get("repository"),
+            package_id=row.get("id"),
+            files=[value for value in row.get("files", []) if value],
+            classes=[value for value in row.get("classes", []) if value],
+            interfaces=[value for value in row.get("interfaces", []) if value],
+            methods=[value for value in row.get("methods", []) if value],
+            hooks=[value for value in row.get("hooks", []) if value],
+            references=[value for value in row.get("references", []) if value],
+            child_packages=sorted(set(child_packages)),
+        )
 
     async def get_codebase_overview(
         self,
@@ -858,8 +1121,11 @@ class GraphClient:
         file_pattern: str | None = None,
         limit: int = 20,
         exact: bool = False,
+        language: str | None = None,
+        stereotype: str | None = None,
     ) -> list[CodeEntity]:
         """Find graph entities by exact or substring symbol match."""
+        limit = self._clamp_result_limit(limit, maximum=50)
         labels = [
             SYMBOL_ENTITY_TYPE_TO_LABEL[entity_type]
             for entity_type in (entity_types or list(SYMBOL_ENTITY_TYPE_TO_LABEL))
@@ -868,22 +1134,30 @@ class GraphClient:
             "n",
             repository=repository,
             file_pattern=file_pattern,
+            language=language,
+            stereotype=stereotype,
         )
-        name_clause = "toLower(n.name) = toLower($query)"
+        name_clause = "toLower(n.name) = toLower($search_query)"
         if not exact:
-            name_clause = "(toLower(n.name) CONTAINS toLower($query) OR toLower(n.file_path) CONTAINS toLower($query))"
+            name_clause = (
+                "(toLower(n.name) CONTAINS toLower($search_query) "
+                "OR toLower(n.file_path) CONTAINS toLower($search_query))"
+            )
 
         cypher = f"""
             MATCH (n)
             WHERE any(label IN labels(n) WHERE label IN $labels)
               AND {name_clause}{filter_clause}
-            RETURN n.name AS name, n.file_path AS file_path,
+            RETURN n.id AS id, n.name AS name, n.file_path AS file_path,
                    n.repository AS repository, n.line_number AS line_number,
                    n.line_end AS line_end, n.code AS code,
-                   n.signature AS signature,
+                   n.signature AS signature, n.language AS language,
+                   n.return_type AS return_type, n.modifiers AS modifiers,
+                   n.stereotypes AS stereotypes, n.content_hash AS content_hash,
+                   properties(n) AS properties,
                    head(labels(n)) AS entity_type
             ORDER BY CASE
-                         WHEN toLower(n.name) = toLower($query) THEN 0
+                         WHEN toLower(n.name) = toLower($search_query) THEN 0
                          ELSE 1
                      END,
                      n.file_path, n.line_number
@@ -892,23 +1166,11 @@ class GraphClient:
         results = await self._query(
             cypher,
             labels=labels,
-            query=query,
+            search_query=query,
             limit=limit,
             **filter_params,
         )
-        return [
-            CodeEntity(
-                name=row["name"],
-                file_path=row["file_path"] or "",
-                repository=row.get("repository"),
-                line_start=row.get("line_number"),
-                line_end=row.get("line_end"),
-                code=row.get("code"),
-                signature=row.get("signature"),
-                entity_type=self._label_to_entity_type(row.get("entity_type")),
-            )
-            for row in results
-        ]
+        return [self._entity_from_record(row) for row in results]
 
     async def get_file_context(
         self,
@@ -930,20 +1192,37 @@ class GraphClient:
             WITH f, packages, classes, collect(DISTINCT iface.name) AS interfaces
             OPTIONAL MATCH (f)-[:CONTAINS]->(method:Method)
             WITH f, packages, classes, interfaces, collect(DISTINCT method.name) AS top_level_methods
-            OPTIONAL MATCH (f)-[:EXPORTS]->(exported)
+            OPTIONAL MATCH (f)-[:CONTAINS]->(ctor:Constructor)
             WITH f, packages, classes, interfaces, top_level_methods,
+                 collect(DISTINCT ctor.name) AS constructors
+            OPTIONAL MATCH (f)-[:CONTAINS]->(field:Field)
+            WITH f, packages, classes, interfaces, top_level_methods, constructors,
+                 collect(DISTINCT field.name) AS fields
+            OPTIONAL MATCH (f)-[:CONTAINS]->(ref:Reference)
+            WITH f, packages, classes, interfaces, top_level_methods, constructors, fields,
+                 collect(DISTINCT ref.name) AS references
+            OPTIONAL MATCH (f)-[export_rel:EXPORTS]->(exported)
+            WITH f, packages, classes, interfaces, top_level_methods, constructors, fields, references,
                  collect(DISTINCT {
+                     id: exported.id,
                      name: exported.name,
                      file_path: exported.file_path,
                      repository: exported.repository,
                      line_start: exported.line_number,
-                     entity_type: toLower(head(labels(exported)))
+                     line_end: exported.line_end,
+                     entity_type: toLower(head(labels(exported))),
+                     language: exported.language,
+                     content_hash: exported.content_hash,
+                     entity_properties: properties(exported),
+                     relationship_properties: properties(export_rel)
                  }) AS exports
             OPTIONAL MATCH (caller)-[:USES_HOOK]->(hook:Hook)
             WHERE caller.repository = f.repository AND caller.file_path = f.file_path
             RETURN f.name AS name, f.file_path AS file_path,
                    f.repository AS repository, f.language AS language,
+                   f.content_hash AS content_hash,
                    packages, classes, interfaces, top_level_methods,
+                   constructors, fields, references,
                    collect(DISTINCT hook.name) AS hooks, exports
         """
         results = await self._query(
@@ -960,8 +1239,17 @@ class GraphClient:
                 name=export["name"],
                 file_path=export.get("file_path") or "",
                 repository=export.get("repository"),
+                entity_id=export.get("id"),
                 line_start=export.get("line_start"),
+                line_end=export.get("line_end"),
                 entity_type=export.get("entity_type") or "class",
+                language=export.get("language"),
+                content_hash=export.get("content_hash"),
+                properties={
+                    **self._custom_entity_properties(export.get("properties")),
+                    **self._custom_entity_properties(export.get("entity_properties")),
+                    **(export.get("relationship_properties") or {}),
+                },
             )
             for export in row.get("exports", [])
             if export.get("name")
@@ -971,12 +1259,16 @@ class GraphClient:
             file_path=row["file_path"] or "",
             repository=row.get("repository"),
             language=row.get("language"),
+            content_hash=row.get("content_hash"),
             packages=[pkg for pkg in row.get("packages", []) if pkg],
             exports=exports,
             classes=[name for name in row.get("classes", []) if name],
             interfaces=[name for name in row.get("interfaces", []) if name],
             top_level_methods=[name for name in row.get("top_level_methods", []) if name],
             hooks=[name for name in row.get("hooks", []) if name],
+            constructors=[name for name in row.get("constructors", []) if name],
+            fields=[name for name in row.get("fields", []) if name],
+            references=[name for name in row.get("references", []) if name],
         )
 
     async def get_hook_usage(
@@ -984,12 +1276,18 @@ class GraphClient:
         hook_name: str,
         repository: str | None = None,
         file_pattern: str | None = None,
+        language: str | None = None,
+        stereotype: str | None = None,
+        limit: int = 50,
     ) -> list[CallGraphNode]:
         """Find methods and constructors that use a materialized hook node."""
+        limit = self._clamp_result_limit(limit)
         filter_clause, filter_params = self._build_search_filters(
             "m",
             repository=repository,
             file_pattern=file_pattern,
+            language=language,
+            stereotype=stereotype,
         )
         cypher = f"""
             MATCH (h:Hook)
@@ -1001,9 +1299,11 @@ class GraphClient:
                    m.signature AS signature, m.line_number AS line_number,
                    head(labels(m)) AS entity_type, 'USES_HOOK' AS relationship_type
             ORDER BY m.file_path, m.line_number
-            LIMIT 50
+            LIMIT $query_limit
         """
-        results = await self._query(cypher, hook_name=hook_name, **filter_params)
+        results = await self._query(cypher, hook_name=hook_name, query_limit=limit + 1, **filter_params)
+        truncated = len(results) > limit
+        results = results[:limit]
         return [
             CallGraphNode(
                 name=row["name"],
@@ -1013,6 +1313,7 @@ class GraphClient:
                 line_start=row.get("line_number"),
                 entity_type=self._label_to_entity_type(row.get("entity_type")),
                 relationship_type=row.get("relationship_type", "USES_HOOK"),
+                truncated=truncated,
             )
             for row in results
         ]
@@ -1050,7 +1351,11 @@ class GraphClient:
             ORDER BY depth, caller.file_path, caller.line_number
             LIMIT 200
         """
-        caller_results = await self._query(callers_cypher, entity_id=target["id"])
+        caller_results = await self._query(
+            callers_cypher,
+            entity_id=target["id"],
+            parameter_suffix=self._parameter_suffix_from_entity_id(target.get("id")),
+        )
 
         tests = []
         endpoints = []

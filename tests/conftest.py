@@ -1,8 +1,45 @@
 """Shared test fixtures for Telescope tests."""
 
+import json
+import os
+import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
+from pathlib import Path
+from uuid import uuid4
 
 import pytest
+from neo4j import AsyncGraphDatabase
+
+from telescope.config import Config
+
+
+TESTS_ROOT = Path(__file__).resolve().parent
+CONTRACT_FIXTURE_ROOT = TESTS_ROOT / "fixtures" / "contract_repo"
+DEFAULT_CONSTELLATION_ROOT = Path("/Users/d.sriram/Desktop/personal/Constellation")
+ALLOWED_ENTITY_LABELS = {
+    "File",
+    "Package",
+    "Class",
+    "Interface",
+    "Method",
+    "Constructor",
+    "Field",
+    "Hook",
+    "Reference",
+}
+ALLOWED_RELATIONSHIP_TYPES = {
+    "CONTAINS",
+    "IN_PACKAGE",
+    "HAS_METHOD",
+    "HAS_CONSTRUCTOR",
+    "HAS_FIELD",
+    "DECLARES",
+    "EXTENDS",
+    "IMPLEMENTS",
+    "CALLS",
+    "USES_HOOK",
+    "EXPORTS",
+}
 
 
 @pytest.fixture()
@@ -59,3 +96,249 @@ def mock_openai_client(mock_openai_response):
     client.embeddings.create = AsyncMock(return_value=mock_openai_response())
     client.close = AsyncMock()
     return client
+
+
+def _require_integration() -> None:
+    """Skip integration fixtures unless explicitly enabled."""
+    if os.environ.get("TELESCOPE_RUN_INTEGRATION") != "1":
+        pytest.skip("Set TELESCOPE_RUN_INTEGRATION=1 to run live Neo4j contract tests")
+
+
+def _constellation_root() -> Path:
+    return Path(os.environ.get("CONSTELLATION_ROOT", DEFAULT_CONSTELLATION_ROOT))
+
+
+def _constellation_python() -> Path:
+    return Path(
+        os.environ.get(
+            "CONSTELLATION_PYTHON",
+            _constellation_root() / ".venv" / "bin" / "python",
+        )
+    )
+
+
+def _neo4j_config() -> Config:
+    return Config(
+        neo4j_uri=os.environ.get("TELESCOPE_TEST_NEO4J_URI", "bolt://localhost:7687"),
+        neo4j_user=os.environ.get("TELESCOPE_TEST_NEO4J_USER", "neo4j"),
+        neo4j_password=os.environ.get("TELESCOPE_TEST_NEO4J_PASSWORD", "constellation"),
+        openai_api_key="sk-test-key",
+    )
+
+
+def _parse_contract_fixture(repository: str) -> dict:
+    """Parse the contract fixture repo with Constellation from its own venv."""
+    script = f"""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, {str(_constellation_root())!r})
+
+from constellation.parsers.registry import get_default_registry
+
+root = Path({str(CONTRACT_FIXTURE_ROOT)!r})
+repository = {repository!r}
+registry = get_default_registry()
+entities = []
+relationships = []
+errors = []
+
+for file_path in sorted(path for path in root.rglob('*') if path.is_file()):
+    parser = registry.get_parser_for_file(file_path)
+    if parser is None:
+        continue
+    result = parser.parse_file(file_path, repository)
+    errors.extend(result.errors)
+    for entity in result.entities:
+        entities.append({{
+            'id': entity.id,
+            'name': entity.name,
+            'entity_type': entity.entity_type.value,
+            'repository': entity.repository,
+            'file_path': entity.file_path,
+            'line_number': entity.line_number,
+            'line_end': entity.line_end,
+            'language': entity.language,
+            'code': entity.code,
+            'signature': entity.signature,
+            'return_type': entity.return_type,
+            'docstring': entity.docstring,
+            'modifiers': entity.modifiers,
+            'stereotypes': entity.stereotypes,
+            'properties': entity.properties,
+            'content_hash': entity.content_hash,
+        }})
+    for relationship in result.relationships:
+        relationships.append({{
+            'source_id': relationship.source_id,
+            'target_id': relationship.target_id,
+            'relationship_type': relationship.relationship_type.value,
+            'properties': relationship.properties,
+        }})
+
+if errors:
+    raise SystemExit('\\n'.join(errors))
+
+print(json.dumps({{'entities': entities, 'relationships': relationships}}))
+"""
+    result = subprocess.run(
+        [str(_constellation_python()), "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+
+    entities_by_id: dict[str, dict] = {}
+    for entity in payload["entities"]:
+        entities_by_id[entity["id"]] = entity
+
+    relationships: list[dict] = []
+    seen_relationships: set[tuple[str, str, str, str]] = set()
+    for relationship in payload["relationships"]:
+        key = (
+            relationship["source_id"],
+            relationship["target_id"],
+            relationship["relationship_type"],
+            json.dumps(relationship.get("properties") or {}, sort_keys=True),
+        )
+        if key in seen_relationships:
+            continue
+        seen_relationships.add(key)
+        relationships.append(relationship)
+
+    return {
+        "entities": list(entities_by_id.values()),
+        "relationships": relationships,
+    }
+
+
+async def _run_write(driver, cypher: str, **params) -> None:
+    async with driver.session() as session:
+        result = await session.run(cypher, **params)
+        await result.consume()
+
+
+async def _delete_repository_graph(driver, repository: str) -> None:
+    await _run_write(driver, "MATCH (n {repository: $repository}) DETACH DELETE n", repository=repository)
+    await _run_write(driver, "MATCH (r:Repository {name: $repository}) DETACH DELETE r", repository=repository)
+
+
+async def _seed_repository_graph(driver, repository: str, payload: dict) -> None:
+    await _delete_repository_graph(driver, repository)
+
+    entity_groups: dict[str, list[dict]] = {}
+    for entity in payload["entities"]:
+        label = entity["entity_type"]
+        assert label in ALLOWED_ENTITY_LABELS
+        custom_properties = entity.get("properties") or {}
+        props = {
+            key: value
+            for key, value in entity.items()
+            if key not in {"entity_type", "properties"} and value is not None
+        }
+        for key, value in custom_properties.items():
+            if value is not None:
+                props.setdefault(key, value)
+        entity_groups.setdefault(label, []).append({"id": entity["id"], "props": props})
+
+    for label, rows in entity_groups.items():
+        await _run_write(
+            driver,
+            f"""
+            UNWIND $rows AS row
+            MERGE (n:{label} {{id: row.id}})
+            SET n = row.props
+            """,
+            rows=rows,
+        )
+
+    relationship_groups: dict[str, list[dict]] = {}
+    for relationship in payload["relationships"]:
+        rel_type = relationship["relationship_type"]
+        assert rel_type in ALLOWED_RELATIONSHIP_TYPES
+        relationship_groups.setdefault(rel_type, []).append(
+            {
+                "source_id": relationship["source_id"],
+                "target_id": relationship["target_id"],
+                "props": relationship.get("properties") or {},
+            }
+        )
+
+    for rel_type, rows in relationship_groups.items():
+        await _run_write(
+            driver,
+            f"""
+            UNWIND $rows AS row
+            MATCH (source {{id: row.source_id}})
+            MATCH (target {{id: row.target_id}})
+            MERGE (source)-[r:{rel_type}]->(target)
+            SET r = row.props
+            """,
+            rows=rows,
+        )
+
+    await _run_write(
+        driver,
+        """
+        MERGE (r:Repository {name: $name})
+        SET r.source = $source,
+            r.last_indexed_at = $last_indexed_at,
+            r.last_commit_sha = $last_commit_sha,
+            r.entity_count = $entity_count
+        """,
+        name=repository,
+        source="contract-fixture",
+        last_indexed_at="2026-03-12T00:00:00+00:00",
+        last_commit_sha="contract-fixture",
+        entity_count=len(payload["entities"]),
+    )
+
+
+@pytest.fixture()
+async def live_neo4j_driver():
+    """Create a real Neo4j driver for live contract tests."""
+    _require_integration()
+    config = _neo4j_config()
+    driver = AsyncGraphDatabase.driver(
+        config.neo4j_uri,
+        auth=(config.neo4j_user, config.neo4j_password),
+    )
+    await driver.verify_connectivity()
+    try:
+        yield driver
+    finally:
+        await driver.close()
+
+
+@pytest.fixture()
+async def live_graph_client():
+    """Create a real Telescope GraphClient against the local Neo4j instance."""
+    _require_integration()
+    with patch("telescope.graph_client.get_config", return_value=_neo4j_config()), \
+         patch("telescope.graph_client.AsyncOpenAI") as mock_openai:
+        mock_client = AsyncMock()
+        mock_client.close = AsyncMock()
+        mock_openai.return_value = mock_client
+        from telescope.graph_client import GraphClient
+
+        client = GraphClient()
+        await client.connect()
+        try:
+            yield client
+        finally:
+            await client.close()
+
+
+@pytest.fixture()
+async def seeded_contract_repository(live_neo4j_driver):
+    """Seed a small Constellation-shaped graph into Neo4j and clean it up."""
+    _require_integration()
+    repository = f"telescope-contract-{uuid4().hex[:8]}"
+    payload = _parse_contract_fixture(repository)
+    await _seed_repository_graph(live_neo4j_driver, repository, payload)
+    try:
+        yield repository
+    finally:
+        await _delete_repository_graph(live_neo4j_driver, repository)

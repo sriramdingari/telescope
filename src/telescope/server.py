@@ -58,8 +58,9 @@ USE telescope when you need to:
 - Analyze blast radius of a change (affected tests, endpoints)
 - Explore class hierarchies and inheritance
 - Get codebase overview and statistics
-- Inspect file-level graph context, exports, and hook usage
+- Inspect file-level graph context, exports, constructors, fields, and hook usage
 - Find exact symbols across files, fields, packages, hooks, and references
+- Inspect repository metadata and package/namespace membership
 
 DON'T use telescope when you need to:
 - Read exact file contents (use Read tool instead)
@@ -78,16 +79,19 @@ DON'T use telescope when you need to:
 
 **Understanding a codebase:**
 1. list_repositories() - see what's indexed
-2. get_codebase_overview(repository="name") - get stats and entry points
+2. get_repository_context("name") - get source metadata and aggregate stats
+3. get_codebase_overview(repository="name") - get stats and entry points
 
 ## Tools
 
 - list_repositories: See all indexed repos
+- get_repository_context: Repository metadata plus aggregate graph stats
 - search_code: Semantic search across embedded entities
 - find_symbols: Exact/substring graph lookup across all persisted entity types
+- get_package_context: Package or namespace membership and child packages
 - get_callers/get_callees: Call relationships, references, and hooks
 - get_function_context: Full context before modifying
-- get_file_context: Packages, exports, top-level entities, and hook usage for one file
+- get_file_context: Packages, exports, constructors, fields, references, and hook usage for one file
 - get_hook_usage: Find React/framework hook consumers
 - get_impact: Blast radius analysis
 - get_class_hierarchy: Inheritance relationships
@@ -122,6 +126,41 @@ VALID_SYMBOL_ENTITY_TYPES = {
 }
 
 
+def _entity_to_dict(entity) -> dict:
+    """Serialize a CodeEntity-style result for MCP responses."""
+    return {
+        "name": entity.name,
+        "file_path": entity.file_path,
+        "repository": entity.repository,
+        "entity_id": entity.entity_id,
+        "line_start": entity.line_start,
+        "line_end": entity.line_end,
+        "code": entity.code,
+        "signature": entity.signature,
+        "entity_type": entity.entity_type,
+        "language": entity.language,
+        "return_type": entity.return_type,
+        "modifiers": entity.modifiers,
+        "stereotypes": entity.stereotypes,
+        "content_hash": entity.content_hash,
+        "properties": entity.properties,
+    }
+
+
+def _call_node_to_dict(node) -> dict:
+    """Serialize a CallGraphNode-style result for MCP responses."""
+    return {
+        "name": node.name,
+        "file_path": node.file_path,
+        "repository": node.repository,
+        "signature": node.signature,
+        "line_start": node.line_start,
+        "entity_type": node.entity_type,
+        "relationship_type": node.relationship_type,
+        "truncated": node.truncated,
+    }
+
+
 @mcp.tool()
 async def search_code(
     query: str,
@@ -129,6 +168,8 @@ async def search_code(
     repository: str | None = None,
     entity_type: str | None = None,
     file_pattern: str | None = None,
+    language: str | None = None,
+    stereotype: str | None = None,
     limit: int = 10,
     code_mode: str = "preview",
 ) -> list[dict]:
@@ -149,6 +190,8 @@ async def search_code(
             - "constructor": Constructor definitions
             If not specified, searches all entity types.
         file_pattern: Filter by file path pattern, e.g., "*/api/*" (optional)
+        language: Filter by persisted language, e.g. "Python" or "TypeScript"
+        stereotype: Filter by persisted stereotype, e.g. "endpoint" or "test"
         limit: Maximum results to return (default 10)
         code_mode: How much code to include in results (default "preview"):
             - "none": No code, just metadata (smallest response)
@@ -157,7 +200,8 @@ async def search_code(
             - "full": Complete source code (use sparingly)
 
     Returns:
-        List of matching code entities with source code and locations
+        List of matching code entities with source code and locations.
+        Identifier-like queries automatically blend in exact graph symbol matches.
     """
     graph = ctx.request_context.lifespan_context.graph
     limit = min(limit, 20)
@@ -180,20 +224,13 @@ async def search_code(
         entity_type=entity_type,
         file_pattern=file_pattern,
         repository=repository,
+        language=language,
+        stereotype=stereotype,
         code_mode=code_mode,
     )
 
     return [
-        {
-            "name": r.name,
-            "file_path": r.file_path,
-            "repository": r.repository,
-            "line_start": r.line_start,
-            "line_end": r.line_end,
-            "code": r.code,
-            "signature": r.signature,
-            "entity_type": r.entity_type,
-        }
+        _entity_to_dict(r)
         for r in results
     ]
 
@@ -205,6 +242,7 @@ async def get_callers(
     repository: str | None = None,
     file_path: str | None = None,
     depth: int = 1,
+    limit: int = 50,
 ) -> list[dict]:
     """
     Find all functions that call the specified method.
@@ -216,9 +254,11 @@ async def get_callers(
         repository: Filter by repository name (e.g., "consumer-operations")
         file_path: Disambiguate if multiple methods have the same name
         depth: How many levels up to traverse (default 1, max 3)
+        limit: Maximum callers to return (default 50, max 200)
 
     Returns:
-        List of functions that call this method
+        List of functions that call this method. Each result includes
+        a `truncated` flag when additional callers exist beyond the limit.
     """
     graph = ctx.request_context.lifespan_context.graph
 
@@ -227,20 +267,10 @@ async def get_callers(
         file_path=file_path,
         repository=repository,
         depth=min(depth, 3),
+        limit=min(limit, 200),
     )
 
-    return [
-        {
-            "name": r.name,
-            "file_path": r.file_path,
-            "repository": r.repository,
-            "signature": r.signature,
-            "line_start": r.line_start,
-            "entity_type": r.entity_type,
-            "relationship_type": r.relationship_type,
-        }
-        for r in results
-    ]
+    return [_call_node_to_dict(r) for r in results]
 
 
 @mcp.tool()
@@ -250,6 +280,7 @@ async def get_callees(
     repository: str | None = None,
     file_path: str | None = None,
     depth: int = 1,
+    limit: int = 50,
 ) -> list[dict]:
     """
     Find all graph targets that the specified method calls or uses.
@@ -261,9 +292,11 @@ async def get_callees(
         repository: Filter by repository name (e.g., "consumer-operations")
         file_path: Disambiguate if multiple methods have the same name
         depth: How many levels down to traverse (default 1, max 3)
+        limit: Maximum graph targets to return (default 50, max 200)
 
     Returns:
-        List of methods, constructors, references, and hooks reached from this method
+        List of methods, constructors, references, and hooks reached from this method.
+        Each result includes a `truncated` flag when additional targets exist.
     """
     graph = ctx.request_context.lifespan_context.graph
 
@@ -272,20 +305,10 @@ async def get_callees(
         file_path=file_path,
         repository=repository,
         depth=min(depth, 3),
+        limit=min(limit, 200),
     )
 
-    return [
-        {
-            "name": r.name,
-            "file_path": r.file_path,
-            "repository": r.repository,
-            "signature": r.signature,
-            "line_start": r.line_start,
-            "entity_type": r.entity_type,
-            "relationship_type": r.relationship_type,
-        }
-        for r in results
-    ]
+    return [_call_node_to_dict(r) for r in results]
 
 
 @mcp.tool()
@@ -421,6 +444,41 @@ async def list_repositories(
 
 
 @mcp.tool()
+async def get_repository_context(
+    repository: str,
+    ctx: Context[ServerSession, AppContext],
+) -> dict:
+    """
+    Get repository metadata plus aggregate graph statistics for one indexed repository.
+    """
+    graph = ctx.request_context.lifespan_context.graph
+    result = await graph.get_repository_context(repository)
+    if not result:
+        raise ValueError(f"Repository '{repository}' not found in graph")
+
+    return {
+        "name": result.name,
+        "source": result.source,
+        "entity_count": result.entity_count,
+        "last_indexed_at": result.last_indexed_at,
+        "last_commit_sha": result.last_commit_sha,
+        "total_files": result.total_files,
+        "total_classes": result.total_classes,
+        "total_interfaces": result.total_interfaces,
+        "total_methods": result.total_methods,
+        "total_constructors": result.total_constructors,
+        "total_fields": result.total_fields,
+        "total_packages": result.total_packages,
+        "total_hooks": result.total_hooks,
+        "total_references": result.total_references,
+        "total_exports": result.total_exports,
+        "languages": result.languages,
+        "top_level_classes": result.top_level_classes,
+        "entry_points": result.entry_points,
+    }
+
+
+@mcp.tool()
 async def get_codebase_overview(
     ctx: Context[ServerSession, AppContext],
     repository: str | None = None,
@@ -476,6 +534,8 @@ async def find_symbols(
     entity_types: list[str] | None = None,
     repository: str | None = None,
     file_pattern: str | None = None,
+    language: str | None = None,
+    stereotype: str | None = None,
     limit: int = 20,
     exact: bool = False,
 ) -> list[dict]:
@@ -484,6 +544,7 @@ async def find_symbols(
 
     Use this when you know the symbol or path fragment you want and need more than
     vector search can provide, including fields, packages, hooks, references, and files.
+    You can also filter by language and stereotype.
     """
     if entity_types:
         invalid = sorted(set(entity_types) - VALID_SYMBOL_ENTITY_TYPES)
@@ -499,22 +560,43 @@ async def find_symbols(
         entity_types=entity_types,
         repository=repository,
         file_pattern=file_pattern,
+        language=language,
+        stereotype=stereotype,
         limit=min(limit, 50),
         exact=exact,
     )
     return [
-        {
-            "name": r.name,
-            "file_path": r.file_path,
-            "repository": r.repository,
-            "line_start": r.line_start,
-            "line_end": r.line_end,
-            "code": r.code,
-            "signature": r.signature,
-            "entity_type": r.entity_type,
-        }
+        _entity_to_dict(r)
         for r in results
     ]
+
+
+@mcp.tool()
+async def get_package_context(
+    package_name: str,
+    ctx: Context[ServerSession, AppContext],
+    repository: str | None = None,
+) -> dict:
+    """
+    Get package or namespace membership, including child packages and symbol counts.
+    """
+    graph = ctx.request_context.lifespan_context.graph
+    result = await graph.get_package_context(package_name=package_name, repository=repository)
+    if not result:
+        raise ValueError(f"Package '{package_name}' not found in graph")
+
+    return {
+        "name": result.name,
+        "repository": result.repository,
+        "package_id": result.package_id,
+        "files": result.files,
+        "classes": result.classes,
+        "interfaces": result.interfaces,
+        "methods": result.methods,
+        "hooks": result.hooks,
+        "references": result.references,
+        "child_packages": result.child_packages,
+    }
 
 
 @mcp.tool()
@@ -539,21 +621,16 @@ async def get_file_context(
         "file_path": result.file_path,
         "repository": result.repository,
         "language": result.language,
+        "content_hash": result.content_hash,
         "packages": result.packages,
-        "exports": [
-            {
-                "name": export.name,
-                "file_path": export.file_path,
-                "repository": export.repository,
-                "line_start": export.line_start,
-                "entity_type": export.entity_type,
-            }
-            for export in result.exports
-        ],
+        "exports": [_entity_to_dict(export) for export in result.exports],
         "classes": result.classes,
         "interfaces": result.interfaces,
         "top_level_methods": result.top_level_methods,
         "hooks": result.hooks,
+        "constructors": result.constructors,
+        "fields": result.fields,
+        "references": result.references,
     }
 
 
@@ -563,28 +640,24 @@ async def get_hook_usage(
     ctx: Context[ServerSession, AppContext],
     repository: str | None = None,
     file_pattern: str | None = None,
+    language: str | None = None,
+    stereotype: str | None = None,
+    limit: int = 50,
 ) -> list[dict]:
     """
     Find methods and constructors that use a materialized Hook node.
+    Results include a `truncated` flag when additional users exist beyond the limit.
     """
     graph = ctx.request_context.lifespan_context.graph
     results = await graph.get_hook_usage(
         hook_name=hook_name,
         repository=repository,
         file_pattern=file_pattern,
+        language=language,
+        stereotype=stereotype,
+        limit=min(limit, 200),
     )
-    return [
-        {
-            "name": r.name,
-            "file_path": r.file_path,
-            "repository": r.repository,
-            "signature": r.signature,
-            "line_start": r.line_start,
-            "entity_type": r.entity_type,
-            "relationship_type": r.relationship_type,
-        }
-        for r in results
-    ]
+    return [_call_node_to_dict(r) for r in results]
 
 
 @mcp.tool()

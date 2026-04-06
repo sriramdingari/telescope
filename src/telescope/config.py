@@ -14,6 +14,8 @@ class Config:
     openai_base_url: str | None = None
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
+    storage_backend: str = "neo4j"
+    postgres_dsn: str = ""
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -26,6 +28,8 @@ class Config:
             openai_base_url=os.environ.get("OPENAI_BASE_URL") or None,
             embedding_model=os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small"),
             embedding_dimensions=int(os.environ.get("EMBEDDING_DIMENSIONS", "1536")),
+            storage_backend=os.environ.get("STORAGE_BACKEND", "neo4j"),
+            postgres_dsn=os.environ.get("POSTGRES_DSN", ""),
         )
 
 

@@ -216,6 +216,16 @@ class PostgresReadBackend(ReadBackend):
         )
 
     @staticmethod
+    def _looks_like_symbol_query(query: str) -> bool:
+        """Heuristic: does this query look like a code identifier rather than
+        a natural-language phrase? Single token with no spaces → yes.
+        Mirrors neo4j.py:200."""
+        stripped = query.strip()
+        if not stripped or " " in stripped:
+            return False
+        return True
+
+    @staticmethod
     def _normalize_repo_row(row: dict) -> dict:
         """Normalize Postgres row to match the API's expectations."""
         result = dict(row)
@@ -280,6 +290,31 @@ class PostgresReadBackend(ReadBackend):
             for e in entities:
                 if e.code:
                     e.code = "\n".join(e.code.splitlines()[:10])
+
+        # Blend in exact-symbol matches when the query looks like an identifier.
+        # Mirrors neo4j.py:572 behavior: a user searching for "UserService"
+        # expects the symbol itself to appear in results, not only semantically
+        # similar methods.
+        if self._looks_like_symbol_query(query):
+            symbol_results = await self.find_symbols(
+                query,
+                entity_types=[entity_type] if entity_type else None,
+                repository=repository,
+                file_pattern=file_pattern,
+                limit=limit,
+                exact=True,
+                language=language,
+                stereotype=stereotype,
+            )
+            # Merge: exact matches first, then vector hits, dedup by entity_id
+            seen_ids = {e.entity_id for e in symbol_results}
+            combined = list(symbol_results)
+            for e in entities:
+                if e.entity_id not in seen_ids:
+                    combined.append(e)
+                    seen_ids.add(e.entity_id)
+            return combined[:limit]
+
         return entities
 
     # ── Symbol lookup ────────────────────────────────────────────────────
@@ -303,7 +338,10 @@ class PostgresReadBackend(ReadBackend):
             conditions.append(f"symbol_name = ${len(params)}")
         else:
             params.append(f"%{query}%")
-            conditions.append(f"symbol_name ILIKE ${len(params)}")
+            # Match both symbol_name and file_path in fuzzy mode (matches Neo4j)
+            conditions.append(
+                f"(symbol_name ILIKE ${len(params)} OR file_path ILIKE ${len(params)})"
+            )
 
         if entity_types:
             labels = [t.capitalize() for t in entity_types]

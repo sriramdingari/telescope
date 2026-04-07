@@ -327,3 +327,84 @@ async def test_get_file_context_populates_exports(backend, mock_pool):
     assert "SomeType" in result.references
     assert "AnotherType" in result.references
     assert len(result.references) == 2
+
+
+def test_looks_like_symbol_query_heuristic():
+    """The identifier heuristic must accept single-word identifiers and
+    reject multi-word phrases."""
+    from telescope.backends.postgres import PostgresReadBackend
+    assert PostgresReadBackend._looks_like_symbol_query("UserService") is True
+    assert PostgresReadBackend._looks_like_symbol_query("get_user_by_id") is True
+    assert PostgresReadBackend._looks_like_symbol_query("authentication logic") is False
+    assert PostgresReadBackend._looks_like_symbol_query("") is False
+    assert PostgresReadBackend._looks_like_symbol_query("  ") is False
+
+
+@pytest.mark.asyncio
+async def test_search_code_blends_exact_symbol_results(backend, mock_pool):
+    """When the query looks like an identifier, search_code must merge in
+    exact symbol results alongside the vector search hits."""
+    backend._get_embedding = AsyncMock(return_value=[0.0] * 1536)
+
+    # Vector search returns 2 fuzzy matches
+    vector_rows = [
+        {"id": "repo::Foo.getUser", "symbol_name": "getUser",
+         "symbol_type": "Method", "file_path": "Foo.java", "repository": "repo",
+         "line_start": 10, "line_end": 20, "signature": "public User getUser()",
+         "code": "...", "docstring": None, "language": "java",
+         "return_type": "User", "modifiers": [], "stereotypes": [],
+         "content_hash": "h", "properties": {}, "score": 0.85},
+    ]
+    # Symbol search (exact=True on "UserService") returns 1 match
+    symbol_rows = [
+        {"id": "repo::UserService", "symbol_name": "UserService",
+         "symbol_type": "Class", "file_path": "UserService.java", "repository": "repo",
+         "line_start": 1, "line_end": 100, "signature": "public class UserService",
+         "code": "...", "docstring": None, "language": "java",
+         "return_type": None, "modifiers": ["public"], "stereotypes": [],
+         "content_hash": "h", "properties": {}},
+    ]
+
+    call_count = {"n": 0}
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        if idx == 0:
+            return vector_rows
+        return symbol_rows
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.search_code("UserService")
+
+    # Must contain BOTH the vector hit AND the exact symbol hit
+    names = [e.name for e in result]
+    assert "getUser" in names
+    assert "UserService" in names
+
+
+@pytest.mark.asyncio
+async def test_find_symbols_matches_file_path_in_fuzzy_mode(backend, mock_pool):
+    """find_symbols fuzzy mode must match BOTH symbol_name AND file_path in an OR."""
+    mock_pool.fetch = AsyncMock(return_value=[
+        {"id": "repo::src/users.py", "symbol_name": "users.py",
+         "symbol_type": "File", "file_path": "src/users.py", "repository": "repo",
+         "line_start": 1, "line_end": 100, "signature": None,
+         "code": None, "docstring": None, "language": "python",
+         "return_type": None, "modifiers": [], "stereotypes": [],
+         "content_hash": "h", "properties": {}},
+    ])
+
+    result = await backend.find_symbols("users.py")
+
+    assert len(result) == 1
+    assert result[0].name == "users.py"
+
+    # Verify the SQL includes BOTH symbol_name AND file_path in an OR
+    sql = mock_pool.fetch.call_args[0][0]
+    assert "symbol_name ILIKE" in sql, \
+        f"Expected symbol_name ILIKE clause in fuzzy find_symbols SQL; got: {sql}"
+    assert "file_path ILIKE" in sql, \
+        f"Expected file_path ILIKE clause in fuzzy find_symbols SQL; got: {sql}"
+    # The two clauses must be OR'd (not AND'd)
+    assert " OR " in sql.upper().replace("\n", " "), \
+        f"Expected OR between symbol_name and file_path clauses; got: {sql}"

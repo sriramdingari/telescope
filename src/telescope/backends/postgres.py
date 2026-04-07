@@ -218,12 +218,20 @@ class PostgresReadBackend(ReadBackend):
     @staticmethod
     def _looks_like_symbol_query(query: str) -> bool:
         """Heuristic: does this query look like a code identifier rather than
-        a natural-language phrase? Single token with no spaces → yes.
-        Mirrors neo4j.py:200."""
+        a natural-language phrase? Mirrors neo4j.py:200.
+
+        Rules:
+        - Must be non-empty and have no spaces
+        - Contains a code-like separator (/, ., ::, _, -) → identifier
+        - Otherwise must contain an uppercase letter after index 0 (CamelCase) → identifier
+        - Single lowercase word like 'user' or 'get' → NOT an identifier
+        """
         stripped = query.strip()
         if not stripped or " " in stripped:
             return False
-        return True
+        if any(token in stripped for token in ("/", ".", "::", "_", "-")):
+            return True
+        return any(char.isupper() for char in stripped[1:])
 
     @staticmethod
     def _normalize_repo_row(row: dict) -> dict:
@@ -306,7 +314,19 @@ class PostgresReadBackend(ReadBackend):
                 language=language,
                 stereotype=stereotype,
             )
-            # Merge: exact matches first, then vector hits, dedup by entity_id
+            # Fallback to fuzzy symbol search if exact returned nothing
+            if not symbol_results:
+                symbol_results = await self.find_symbols(
+                    query,
+                    entity_types=[entity_type] if entity_type else None,
+                    repository=repository,
+                    file_pattern=file_pattern,
+                    limit=limit,
+                    exact=False,
+                    language=language,
+                    stereotype=stereotype,
+                )
+            # Merge: exact (or fuzzy fallback) matches first, then vector hits, dedup by entity_id
             seen_ids = {e.entity_id for e in symbol_results}
             combined = list(symbol_results)
             for e in entities:
@@ -396,7 +416,9 @@ class PostgresReadBackend(ReadBackend):
                        s.is_test, s.is_endpoint, 1 AS depth
                 FROM code_references r
                 JOIN code_symbols s ON s.id = r.source_symbol_id
-                WHERE r.target_symbol_id = ANY($1) AND r.ref_type = 'CALLS'
+                WHERE r.target_symbol_id = ANY($1)
+                  AND r.ref_type = 'CALLS'
+                  AND s.id != ALL($1)
                 UNION
                 SELECT s.id, s.symbol_name, s.file_path, s.repository,
                        s.signature, s.line_start, s.symbol_type,
@@ -405,6 +427,7 @@ class PostgresReadBackend(ReadBackend):
                 JOIN code_symbols s ON s.id = r.source_symbol_id
                 JOIN callers c ON c.id = r.target_symbol_id
                 WHERE c.depth < $2
+                  AND s.id != ALL($1)
             )
             SELECT DISTINCT ON (id) * FROM callers ORDER BY id, depth
             LIMIT $3
@@ -789,8 +812,14 @@ class PostgresReadBackend(ReadBackend):
                   AND s.id != ALL($1)
             )
             SELECT DISTINCT ON (id) * FROM callers ORDER BY id, depth
-            LIMIT 10000
+            LIMIT 10001
         """, family_ids, depth)
+
+        # Detect the hard cap being hit so truncated reflects reality even
+        # when the per-category limit is not set.
+        hit_hard_cap = len(rows) > 10000
+        if hit_hard_cap:
+            rows = rows[:10000]
 
         # Categorize ALL rows (not truncated ones)
         tests = [r for r in rows if r["is_test"]]
@@ -803,9 +832,9 @@ class PostgresReadBackend(ReadBackend):
         total_endpoints = len(endpoints)
 
         # Per-category limit truncation (matches Neo4j's behavior)
-        truncated = False
+        truncated = hit_hard_cap
         if limit is not None:
-            truncated = (
+            truncated = truncated or (
                 len(tests) > limit
                 or len(endpoints) > limit
                 or len(others) > limit

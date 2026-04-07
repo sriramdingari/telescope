@@ -330,14 +330,21 @@ async def test_get_file_context_populates_exports(backend, mock_pool):
 
 
 def test_looks_like_symbol_query_heuristic():
-    """The identifier heuristic must accept single-word identifiers and
-    reject multi-word phrases."""
-    from telescope.backends.postgres import PostgresReadBackend
-    assert PostgresReadBackend._looks_like_symbol_query("UserService") is True
-    assert PostgresReadBackend._looks_like_symbol_query("get_user_by_id") is True
-    assert PostgresReadBackend._looks_like_symbol_query("authentication logic") is False
-    assert PostgresReadBackend._looks_like_symbol_query("") is False
-    assert PostgresReadBackend._looks_like_symbol_query("  ") is False
+    """Mirrors neo4j.py:200 — identifies code-like tokens."""
+    from telescope.backends.postgres import PostgresReadBackend as P
+    # Positive: CamelCase, snake_case, dotted, path-like, kebab-case
+    assert P._looks_like_symbol_query("UserService") is True
+    assert P._looks_like_symbol_query("get_user_by_id") is True
+    assert P._looks_like_symbol_query("com.example.Foo") is True
+    assert P._looks_like_symbol_query("src/foo.py") is True
+    assert P._looks_like_symbol_query("some-package") is True
+    assert P._looks_like_symbol_query("std::vector") is True
+    # Negative: empty, whitespace, multi-word, single lowercase word
+    assert P._looks_like_symbol_query("") is False
+    assert P._looks_like_symbol_query("  ") is False
+    assert P._looks_like_symbol_query("authentication logic") is False
+    assert P._looks_like_symbol_query("user") is False
+    assert P._looks_like_symbol_query("get") is False
 
 
 @pytest.mark.asyncio
@@ -380,6 +387,9 @@ async def test_search_code_blends_exact_symbol_results(backend, mock_pool):
     names = [e.name for e in result]
     assert "getUser" in names
     assert "UserService" in names
+    # Exact symbol match must come BEFORE vector hit in the blended result
+    assert names.index("UserService") < names.index("getUser"), \
+        "Exact symbol match must appear before vector hit"
 
 
 @pytest.mark.asyncio
@@ -405,6 +415,14 @@ async def test_find_symbols_matches_file_path_in_fuzzy_mode(backend, mock_pool):
         f"Expected symbol_name ILIKE clause in fuzzy find_symbols SQL; got: {sql}"
     assert "file_path ILIKE" in sql, \
         f"Expected file_path ILIKE clause in fuzzy find_symbols SQL; got: {sql}"
-    # The two clauses must be OR'd (not AND'd)
-    assert " OR " in sql.upper().replace("\n", " "), \
-        f"Expected OR between symbol_name and file_path clauses; got: {sql}"
+    # Verify the two ILIKE clauses are joined by OR, not AND, and appear
+    # together in a single grouped clause (not spread across other parts
+    # of the query where OR might legitimately appear).
+    import re
+    # Match: (symbol_name ILIKE $N OR file_path ILIKE $N) — allowing whitespace variation
+    pattern = re.compile(
+        r"\(\s*symbol_name\s+ILIKE\s+\$\d+\s+OR\s+file_path\s+ILIKE\s+\$\d+\s*\)",
+        re.IGNORECASE,
+    )
+    assert pattern.search(sql), \
+        f"Expected '(symbol_name ILIKE $N OR file_path ILIKE $N)' grouped clause; got: {sql}"

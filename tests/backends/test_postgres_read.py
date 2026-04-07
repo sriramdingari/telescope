@@ -110,6 +110,108 @@ async def test_get_codebase_overview_returns_empty(backend, mock_pool):
 
 
 @pytest.mark.asyncio
+async def test_resolve_method_family_returns_overrides(backend, mock_pool):
+    """_resolve_method_family must return the original method plus siblings
+    on classes related via IMPLEMENTS/EXTENDS."""
+    mock_pool.fetch = AsyncMock(return_value=[
+        {"id": "repo::IFoo.doIt"},
+        {"id": "repo::FooImpl.doIt"},
+        {"id": "repo::FooSub.doIt"},
+    ])
+
+    symbol = {"id": "repo::FooImpl.doIt", "symbol_name": "doIt"}
+    family_ids = await backend._resolve_method_family(symbol)
+
+    assert "repo::IFoo.doIt" in family_ids
+    assert "repo::FooImpl.doIt" in family_ids
+    assert "repo::FooSub.doIt" in family_ids
+    assert len(family_ids) == 3
+
+    # Verify the SQL was called with symbol["id"] as $1 and symbol["symbol_name"] as $2
+    call_args = mock_pool.fetch.call_args[0]
+    assert call_args[1] == "repo::FooImpl.doIt", \
+        f"Expected symbol id as $1, got {call_args[1]}"
+    assert call_args[2] == "doIt", \
+        f"Expected symbol_name as $2, got {call_args[2]}"
+
+
+@pytest.mark.asyncio
+async def test_get_callers_uses_method_family_for_polymorphism(backend, mock_pool):
+    """get_callers must pass the full method family to the recursive CTE
+    so callers of a polymorphic override are found regardless of which
+    concrete method was resolved."""
+    # Patch _resolve_symbol and _resolve_method_family to focus on get_callers logic
+    async def fake_resolve(*args, **kwargs):
+        return {"id": "repo::FooImpl.doIt", "symbol_name": "doIt",
+                "file_path": "Foo.java", "repository": "repo"}
+    async def fake_family(symbol):
+        return ["repo::IFoo.doIt", "repo::FooImpl.doIt", "repo::FooSub.doIt"]
+
+    backend._resolve_symbol = fake_resolve
+    backend._resolve_method_family = fake_family
+    mock_pool.fetch = AsyncMock(return_value=[])  # no callers for simplicity
+
+    await backend.get_callers("doIt")
+
+    # Verify the recursive CTE was called with an array parameter (family IDs)
+    assert mock_pool.fetch.call_count >= 1
+    # The first positional arg after the SQL should be a list
+    sql = mock_pool.fetch.call_args[0][0]
+    args = mock_pool.fetch.call_args[0][1:]
+    assert isinstance(args[0], list), f"Expected list of family IDs, got {type(args[0])}"
+    assert len(args[0]) == 3
+    # The SQL should use ANY($1), not $1 alone
+    assert "ANY($1)" in sql
+    # Verify exact family IDs are passed, not just the count
+    assert set(args[0]) == {
+        "repo::IFoo.doIt",
+        "repo::FooImpl.doIt",
+        "repo::FooSub.doIt",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_callees_uses_method_family_for_polymorphism(backend, mock_pool):
+    """get_callees must pass the full method family to the recursive CTE
+    AND to the USES_HOOK query, symmetric to get_callers."""
+    async def fake_resolve(*args, **kwargs):
+        return {"id": "repo::FooImpl.doIt", "symbol_name": "doIt",
+                "file_path": "Foo.java", "repository": "repo"}
+    async def fake_family(symbol):
+        return ["repo::IFoo.doIt", "repo::FooImpl.doIt", "repo::FooSub.doIt"]
+
+    backend._resolve_symbol = fake_resolve
+    backend._resolve_method_family = fake_family
+    mock_pool.fetch = AsyncMock(return_value=[])
+
+    await backend.get_callees("doIt")
+
+    # get_callees makes 2 fetch calls: CALLS recursive CTE + USES_HOOK query
+    assert mock_pool.fetch.call_count == 2
+
+    # First call (CALLS): expects family_ids as $1
+    first_sql, *first_args = mock_pool.fetch.call_args_list[0][0]
+    assert "ANY($1)" in first_sql
+    assert isinstance(first_args[0], list)
+    assert set(first_args[0]) == {
+        "repo::IFoo.doIt",
+        "repo::FooImpl.doIt",
+        "repo::FooSub.doIt",
+    }
+
+    # Second call (USES_HOOK): also uses family_ids
+    second_sql, *second_args = mock_pool.fetch.call_args_list[1][0]
+    assert "USES_HOOK" in second_sql
+    assert "ANY($1)" in second_sql
+    assert isinstance(second_args[0], list)
+    assert set(second_args[0]) == {
+        "repo::IFoo.doIt",
+        "repo::FooImpl.doIt",
+        "repo::FooSub.doIt",
+    }
+
+
+@pytest.mark.asyncio
 async def test_get_file_context_populates_exports(backend, mock_pool):
     """get_file_context must actually return exports, not hardcode [] ."""
     # Mock pool.fetch to return different things for different queries in order:

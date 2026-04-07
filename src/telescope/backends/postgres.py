@@ -106,6 +106,80 @@ class PostgresReadBackend(ReadBackend):
             )
         return dict(rows[0])
 
+    async def _resolve_method_family(self, symbol: dict) -> list[str]:
+        """Return the list of method IDs that form the polymorphic family
+        of the given method: the method itself plus all sibling overrides
+        on classes/interfaces related via IMPLEMENTS/EXTENDS (up to 3 hops
+        in either direction).
+
+        Mirrors Neo4j's _method_family_fragment. The returned list is used
+        as the starting set for get_callers/get_callees/get_impact recursive
+        traversals, so polymorphic edges are followed correctly.
+
+        KNOWN GAP: Neo4j's family fragment also filters by `parameter_suffix`
+        to disambiguate overloaded methods (same name, different signatures).
+        This port returns ALL same-name methods, which is a permissive
+        superset of the correct answer — callers of ANY overload appear.
+        Overload disambiguation is deferred to a follow-up.
+        """
+        pool = self._require_pool()
+
+        rows = await pool.fetch("""
+            WITH RECURSIVE
+            -- 1. Find the owning class/interface of the starting method
+            owner AS (
+                SELECT s.id FROM code_references r
+                JOIN code_symbols s ON s.id = r.source_symbol_id
+                WHERE r.target_symbol_id = $1
+                  AND r.ref_type IN ('HAS_METHOD', 'HAS_CONSTRUCTOR')
+                  AND s.symbol_type IN ('Class', 'Interface')
+            ),
+            -- 2. Walk EXTENDS/IMPLEMENTS up from the owner (parents/interfaces)
+            up_chain AS (
+                SELECT id, 0 AS hops FROM owner
+                UNION
+                SELECT s.id, u.hops + 1
+                FROM code_references r
+                JOIN code_symbols s ON s.id = r.target_symbol_id
+                JOIN up_chain u ON u.id = r.source_symbol_id
+                WHERE r.ref_type IN ('EXTENDS', 'IMPLEMENTS')
+                  AND s.symbol_type IN ('Class', 'Interface')
+                  AND u.hops < 3
+            ),
+            -- 3. Walk EXTENDS/IMPLEMENTS down from the owner (subclasses/implementors)
+            down_chain AS (
+                SELECT id, 0 AS hops FROM owner
+                UNION
+                SELECT s.id, d.hops + 1
+                FROM code_references r
+                JOIN code_symbols s ON s.id = r.source_symbol_id
+                JOIN down_chain d ON d.id = r.target_symbol_id
+                WHERE r.ref_type IN ('EXTENDS', 'IMPLEMENTS')
+                  AND s.symbol_type IN ('Class', 'Interface')
+                  AND d.hops < 3
+            ),
+            -- 4. Combine up+down into the full family of related owners
+            family_owners AS (
+                SELECT id FROM up_chain
+                UNION
+                SELECT id FROM down_chain
+            )
+            -- 5. Find all same-name methods on those owners
+            SELECT DISTINCT m.id
+            FROM code_references r
+            JOIN code_symbols m ON m.id = r.target_symbol_id
+            JOIN family_owners fo ON fo.id = r.source_symbol_id
+            WHERE r.ref_type IN ('HAS_METHOD', 'HAS_CONSTRUCTOR')
+              AND m.symbol_name = $2
+              AND m.symbol_type IN ('Method', 'Constructor')
+        """, symbol["id"], symbol["symbol_name"])
+
+        family_ids = [r["id"] for r in rows]
+        # Always include the starting symbol, even if it has no owner (top-level fn)
+        if symbol["id"] not in family_ids:
+            family_ids.append(symbol["id"])
+        return family_ids
+
     def _row_to_code_entity(self, row: dict, score: float = 0.0) -> CodeEntity:
         return CodeEntity(
             name=row["symbol_name"],
@@ -274,6 +348,9 @@ class PostgresReadBackend(ReadBackend):
         if not symbol:
             return []
 
+        # Expand to the full polymorphic method family
+        family_ids = await self._resolve_method_family(symbol)
+
         rows = await pool.fetch("""
             WITH RECURSIVE callers AS (
                 SELECT s.id, s.symbol_name, s.file_path, s.repository,
@@ -281,7 +358,7 @@ class PostgresReadBackend(ReadBackend):
                        s.is_test, s.is_endpoint, 1 AS depth
                 FROM code_references r
                 JOIN code_symbols s ON s.id = r.source_symbol_id
-                WHERE r.target_symbol_id = $1 AND r.ref_type = 'CALLS'
+                WHERE r.target_symbol_id = ANY($1) AND r.ref_type = 'CALLS'
                 UNION
                 SELECT s.id, s.symbol_name, s.file_path, s.repository,
                        s.signature, s.line_start, s.symbol_type,
@@ -293,7 +370,7 @@ class PostgresReadBackend(ReadBackend):
             )
             SELECT DISTINCT ON (id) * FROM callers ORDER BY id, depth
             LIMIT $3
-        """, symbol["id"], depth, limit)
+        """, family_ids, depth, limit)
 
         return [self._row_to_call_graph_node(dict(r)) for r in rows]
 
@@ -313,6 +390,8 @@ class PostgresReadBackend(ReadBackend):
         if not symbol:
             return []
 
+        family_ids = await self._resolve_method_family(symbol)
+
         call_rows = await pool.fetch("""
             WITH RECURSIVE callees AS (
                 SELECT s.id, s.symbol_name, s.file_path, s.repository,
@@ -320,7 +399,7 @@ class PostgresReadBackend(ReadBackend):
                        s.is_test, s.is_endpoint, 1 AS depth
                 FROM code_references r
                 JOIN code_symbols s ON s.id = r.target_symbol_id
-                WHERE r.source_symbol_id = $1 AND r.ref_type = 'CALLS'
+                WHERE r.source_symbol_id = ANY($1) AND r.ref_type = 'CALLS'
                 UNION
                 SELECT s.id, s.symbol_name, s.file_path, s.repository,
                        s.signature, s.line_start, s.symbol_type,
@@ -332,7 +411,7 @@ class PostgresReadBackend(ReadBackend):
             )
             SELECT DISTINCT ON (id) * FROM callees ORDER BY id, depth
             LIMIT $3
-        """, symbol["id"], depth, limit)
+        """, family_ids, depth, limit)
 
         hook_rows = await pool.fetch("""
             SELECT s.id, s.symbol_name, s.file_path, s.repository,
@@ -340,8 +419,8 @@ class PostgresReadBackend(ReadBackend):
                    s.is_test, s.is_endpoint, 1 AS depth
             FROM code_references r
             JOIN code_symbols s ON s.id = r.target_symbol_id
-            WHERE r.source_symbol_id = $1 AND r.ref_type = 'USES_HOOK'
-        """, symbol["id"])
+            WHERE r.source_symbol_id = ANY($1) AND r.ref_type = 'USES_HOOK'
+        """, family_ids)
 
         results = [self._row_to_call_graph_node(dict(r)) for r in call_rows]
         results += [self._row_to_call_graph_node(dict(r), rel_type="USES_HOOK") for r in hook_rows]

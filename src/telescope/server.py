@@ -8,7 +8,9 @@ from collections.abc import AsyncIterator
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.session import ServerSession
 
-from .graph_client import GraphClient
+from .backends.base import ReadBackend
+from .backends.factory import create_read_backend
+from .config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +23,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AppContext:
     """Shared resources initialized at startup."""
-    graph: GraphClient
+    graph: ReadBackend
 
 
 @asynccontextmanager
@@ -29,7 +31,8 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     """Initialize and cleanup resources."""
     logger.info("Initializing Telescope server...")
 
-    graph = GraphClient()
+    config = get_config()
+    graph = create_read_backend(config)
     await graph.connect()
 
     logger.info("Telescope server ready")

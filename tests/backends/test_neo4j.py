@@ -1,4 +1,4 @@
-"""Tests for the Neo4j graph client."""
+"""Tests for the Neo4jReadBackend."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -30,23 +30,23 @@ def test_config():
 
 @pytest.fixture()
 def patched_config(test_config):
-    """Patch get_config in graph_client to return test_config."""
-    with patch("telescope.graph_client.get_config", return_value=test_config):
+    """Patch get_config in backends.neo4j to return test_config."""
+    with patch("telescope.backends.neo4j.get_config", return_value=test_config):
         yield test_config
 
 
-class TestGraphClientConnect:
-    """Tests for GraphClient.connect()."""
+class TestNeo4jReadBackendConnect:
+    """Tests for Neo4jReadBackend.connect()."""
 
     async def test_connect_creates_driver(self, patched_config):
         """Verify AsyncGraphDatabase.driver is called with correct URI and auth."""
-        with patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.graph_client.AsyncOpenAI"):
+        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.backends.neo4j.AsyncOpenAI"):
             mock_driver = AsyncMock()
             mock_driver.verify_connectivity = AsyncMock()
             mock_gdb.driver = MagicMock(return_value=mock_driver)
-            from telescope.graph_client import GraphClient
-            client = GraphClient()
+            from telescope.backends.neo4j import Neo4jReadBackend
+            client = Neo4jReadBackend()
             await client.connect()
             mock_gdb.driver.assert_called_once_with(
                 "bolt://localhost:7687",
@@ -55,23 +55,23 @@ class TestGraphClientConnect:
 
     async def test_connect_verifies_connectivity(self, patched_config, mock_neo4j_driver):
         """Startup should fail fast if Neo4j connectivity is broken."""
-        with patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.graph_client.AsyncOpenAI"):
+        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.backends.neo4j.AsyncOpenAI"):
             mock_gdb.driver = MagicMock(return_value=mock_neo4j_driver)
-            from telescope.graph_client import GraphClient
-            client = GraphClient()
+            from telescope.backends.neo4j import Neo4jReadBackend
+            client = Neo4jReadBackend()
             await client.connect()
             mock_neo4j_driver.verify_connectivity.assert_awaited_once()
 
     async def test_connect_creates_openai_client(self, patched_config):
         """Verify AsyncOpenAI is called with api_key."""
-        with patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.graph_client.AsyncOpenAI") as mock_openai:
+        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.backends.neo4j.AsyncOpenAI") as mock_openai:
             mock_driver = AsyncMock()
             mock_driver.verify_connectivity = AsyncMock()
             mock_gdb.driver = MagicMock(return_value=mock_driver)
-            from telescope.graph_client import GraphClient
-            client = GraphClient()
+            from telescope.backends.neo4j import Neo4jReadBackend
+            client = Neo4jReadBackend()
             await client.connect()
             call_kwargs = mock_openai.call_args[1]
             assert call_kwargs["api_key"] == "sk-test-key"
@@ -79,14 +79,14 @@ class TestGraphClientConnect:
     async def test_connect_passes_base_url_when_set(self, test_config):
         """When openai_base_url is set, AsyncOpenAI is called with base_url."""
         test_config.openai_base_url = "https://my-custom-openai.example.com"
-        with patch("telescope.graph_client.get_config", return_value=test_config), \
-             patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.graph_client.AsyncOpenAI") as mock_openai:
+        with patch("telescope.backends.neo4j.get_config", return_value=test_config), \
+             patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.backends.neo4j.AsyncOpenAI") as mock_openai:
             mock_driver = AsyncMock()
             mock_driver.verify_connectivity = AsyncMock()
             mock_gdb.driver = MagicMock(return_value=mock_driver)
-            from telescope.graph_client import GraphClient
-            client = GraphClient()
+            from telescope.backends.neo4j import Neo4jReadBackend
+            client = Neo4jReadBackend()
             await client.connect()
             call_kwargs = mock_openai.call_args[1]
             assert call_kwargs.get("base_url") == "https://my-custom-openai.example.com"
@@ -94,48 +94,48 @@ class TestGraphClientConnect:
     async def test_connect_omits_base_url_when_none(self, patched_config):
         """When openai_base_url is None, AsyncOpenAI is NOT called with base_url."""
         assert patched_config.openai_base_url is None
-        with patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.graph_client.AsyncOpenAI") as mock_openai:
+        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.backends.neo4j.AsyncOpenAI") as mock_openai:
             mock_driver = AsyncMock()
             mock_driver.verify_connectivity = AsyncMock()
             mock_gdb.driver = MagicMock(return_value=mock_driver)
-            from telescope.graph_client import GraphClient
-            client = GraphClient()
+            from telescope.backends.neo4j import Neo4jReadBackend
+            client = Neo4jReadBackend()
             await client.connect()
             call_kwargs = mock_openai.call_args[1]
             assert "base_url" not in call_kwargs
 
 
-class TestGraphClientClose:
-    """Tests for GraphClient.close()."""
+class TestNeo4jReadBackendClose:
+    """Tests for Neo4jReadBackend.close()."""
 
     async def test_close_calls_driver_close(self, patched_config, mock_neo4j_driver):
         """Verify driver.close() is called when driver exists."""
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._driver = mock_neo4j_driver
         await client.close()
         mock_neo4j_driver.close.assert_called_once()
 
     async def test_close_calls_openai_close(self, patched_config, mock_openai_client):
         """Verify the OpenAI client is closed when present."""
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._openai = mock_openai_client
         await client.close()
         mock_openai_client.close.assert_awaited_once()
 
     async def test_close_safe_when_not_connected(self, patched_config):
         """No error when _driver is None (never connected)."""
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         assert client._driver is None
         # Should not raise
         await client.close()
 
 
-class TestGraphClientQuery:
-    """Tests for GraphClient._query()."""
+class TestNeo4jReadBackendQuery:
+    """Tests for Neo4jReadBackend._query()."""
 
     async def test_query_runs_cypher_and_returns_dicts(
         self, patched_config, mock_neo4j_driver, mock_neo4j_result
@@ -145,8 +145,8 @@ class TestGraphClientQuery:
         mock_neo4j_driver.session.return_value.run = AsyncMock(
             return_value=mock_neo4j_result(expected_data)
         )
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._driver = mock_neo4j_driver
         result = await client._query("MATCH (n) RETURN n")
         assert result == expected_data
@@ -158,8 +158,8 @@ class TestGraphClientQuery:
         mock_session = mock_neo4j_driver.session.return_value
         mock_result = mock_neo4j_result([{"name": "foo"}])
         mock_session.run = AsyncMock(return_value=mock_result)
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._driver = mock_neo4j_driver
         await client._query("MATCH (n) RETURN n")
         mock_result.data.assert_awaited_once()
@@ -171,8 +171,8 @@ class TestGraphClientQuery:
         """Verify params are passed to session.run()."""
         mock_session = mock_neo4j_driver.session.return_value
         mock_session.run = AsyncMock(return_value=mock_neo4j_result([]))
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._driver = mock_neo4j_driver
         await client._query("MATCH (n {name: $name}) RETURN n", name="MyClass")
         mock_session.run.assert_called_once_with(
@@ -180,15 +180,15 @@ class TestGraphClientQuery:
         )
 
 
-class TestGraphClientGetEmbedding:
-    """Tests for GraphClient._get_embedding()."""
+class TestNeo4jReadBackendGetEmbedding:
+    """Tests for Neo4jReadBackend._get_embedding()."""
 
     async def test_get_embedding_calls_openai(
         self, patched_config, mock_openai_client
     ):
         """Verify embeddings.create() is called with correct model, input, dimensions."""
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._openai = mock_openai_client
         await client._get_embedding("search query text")
         mock_openai_client.embeddings.create.assert_called_once_with(
@@ -205,8 +205,8 @@ class TestGraphClientGetEmbedding:
         mock_openai_client.embeddings.create = AsyncMock(
             return_value=mock_openai_response(embedding=expected_vector)
         )
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._openai = mock_openai_client
         result = await client._get_embedding("some text")
         assert result == expected_vector
@@ -253,17 +253,17 @@ def _make_search_result(
 
 @pytest.fixture()
 def graph_client(test_config):
-    """Create a GraphClient with mocked internals for search_code tests."""
-    with patch("telescope.graph_client.get_config", return_value=test_config):
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+    """Create a Neo4jReadBackend with mocked internals for search_code tests."""
+    with patch("telescope.backends.neo4j.get_config", return_value=test_config):
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
     client._driver = AsyncMock()
     client._openai = AsyncMock()
     return client
 
 
 class TestSearchCode:
-    """Tests for GraphClient.search_code()."""
+    """Tests for Neo4jReadBackend.search_code()."""
 
     async def test_search_code_calls_get_embedding(self, graph_client):
         """Verify _get_embedding called with query text."""
@@ -479,7 +479,7 @@ class TestSearchCode:
 
 
 class TestGetCallers:
-    """Tests for GraphClient.get_callers()."""
+    """Tests for Neo4jReadBackend.get_callers()."""
 
     async def test_get_callers_basic(self, graph_client):
         """Returns list of CallGraphNode from mock results."""
@@ -605,7 +605,7 @@ class TestGetCallers:
 
 
 class TestGetCallees:
-    """Tests for GraphClient.get_callees()."""
+    """Tests for Neo4jReadBackend.get_callees()."""
 
     async def test_get_callees_basic(self, graph_client):
         """Returns list of CallGraphNode from mock results."""
@@ -783,7 +783,7 @@ def _make_function_context_result(
 
 
 class TestGetFunctionContext:
-    """Tests for GraphClient.get_function_context()."""
+    """Tests for Neo4jReadBackend.get_function_context()."""
 
     async def test_get_function_context_returns_context(self, graph_client):
         """Basic return with all fields populated."""
@@ -935,7 +935,7 @@ def _make_class_hierarchy_result(
 
 
 class TestGetClassHierarchy:
-    """Tests for GraphClient.get_class_hierarchy()."""
+    """Tests for Neo4jReadBackend.get_class_hierarchy()."""
 
     async def test_get_class_hierarchy_returns_hierarchy(self, graph_client):
         """Basic return with all fields populated."""
@@ -1085,7 +1085,7 @@ class TestGetClassHierarchy:
 
 
 class TestListRepositories:
-    """Tests for GraphClient.list_repositories()."""
+    """Tests for Neo4jReadBackend.list_repositories()."""
 
     async def test_list_repositories_queries_repository_nodes(self, graph_client):
         """Verify Cypher contains MATCH (r:Repository) not aggregation."""
@@ -1115,7 +1115,7 @@ class TestListRepositories:
 
 
 class TestGetRepositoryContext:
-    """Tests for GraphClient.get_repository_context()."""
+    """Tests for Neo4jReadBackend.get_repository_context()."""
 
     async def test_get_repository_context_returns_repository_metadata(self, graph_client):
         graph_client._query = AsyncMock(side_effect=[
@@ -1176,7 +1176,7 @@ class TestGetRepositoryContext:
 
 
 class TestGetPackageContext:
-    """Tests for GraphClient.get_package_context()."""
+    """Tests for Neo4jReadBackend.get_package_context()."""
 
     async def test_get_package_context_returns_package_members(self, graph_client):
         graph_client._query = AsyncMock(return_value=[
@@ -1242,7 +1242,7 @@ class TestGetPackageContext:
 
 
 class TestGetCodebaseOverview:
-    """Tests for GraphClient.get_codebase_overview()."""
+    """Tests for Neo4jReadBackend.get_codebase_overview()."""
 
     async def test_get_codebase_overview_returns_stats(self, graph_client):
         """Basic return with all counts."""
@@ -1502,7 +1502,7 @@ def _make_impact_target(
 
 
 class TestGetImpact:
-    """Tests for GraphClient.get_impact()."""
+    """Tests for Neo4jReadBackend.get_impact()."""
 
     async def test_get_impact_returns_result(self, graph_client):
         """Basic return with target info and counts."""
@@ -1690,7 +1690,7 @@ class TestGetImpact:
 
 
 class TestFindSymbols:
-    """Tests for GraphClient.find_symbols()."""
+    """Tests for Neo4jReadBackend.find_symbols()."""
 
     async def test_find_symbols_queries_requested_entity_types(self, graph_client):
         graph_client._query = AsyncMock(return_value=[])
@@ -1799,7 +1799,7 @@ class TestFindSymbols:
 
 
 class TestGetFileContext:
-    """Tests for GraphClient.get_file_context()."""
+    """Tests for Neo4jReadBackend.get_file_context()."""
 
     async def test_get_file_context_returns_file_details(self, graph_client):
         graph_client._query = AsyncMock(side_effect=[
@@ -1909,7 +1909,7 @@ class TestGetFileContext:
 
 
 class TestGetHookUsage:
-    """Tests for GraphClient.get_hook_usage()."""
+    """Tests for Neo4jReadBackend.get_hook_usage()."""
 
     async def test_get_hook_usage_returns_callers(self, graph_client):
         graph_client._query = AsyncMock(return_value=[

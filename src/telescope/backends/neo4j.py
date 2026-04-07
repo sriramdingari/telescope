@@ -1,4 +1,4 @@
-"""Neo4j graph client for querying Constellation's code knowledge graph."""
+"""Neo4j implementation of ReadBackend for querying Constellation's code knowledge graph."""
 
 import logging
 import re
@@ -7,8 +7,8 @@ from typing import Any
 from neo4j import AsyncGraphDatabase
 from openai import AsyncOpenAI
 
-from .config import get_config
-from .models import (
+from telescope.config import get_config
+from telescope.models import (
     CallGraphNode,
     ClassHierarchy,
     CodebaseOverview,
@@ -19,6 +19,7 @@ from .models import (
     PackageContext,
     RepositoryContext,
 )
+from telescope.backends.base import ReadBackend
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +72,8 @@ ENTITY_RESERVED_PROPERTIES = {
 }
 
 
-class GraphClient:
-    """Client for querying Constellation's code knowledge graph."""
+class Neo4jReadBackend(ReadBackend):
+    """Neo4j implementation of ReadBackend."""
 
     def __init__(self):
         self.config = get_config()
@@ -103,11 +104,11 @@ class GraphClient:
     def _normalize_value(value: Any) -> Any:
         """Convert Neo4j-specific scalar types into JSON-safe values."""
         if isinstance(value, dict):
-            return {k: GraphClient._normalize_value(v) for k, v in value.items()}
+            return {k: Neo4jReadBackend._normalize_value(v) for k, v in value.items()}
         if isinstance(value, list):
-            return [GraphClient._normalize_value(v) for v in value]
+            return [Neo4jReadBackend._normalize_value(v) for v in value]
         if isinstance(value, tuple):
-            return tuple(GraphClient._normalize_value(v) for v in value)
+            return tuple(Neo4jReadBackend._normalize_value(v) for v in value)
 
         iso_format = getattr(value, "iso_format", None)
         if callable(iso_format):
@@ -508,6 +509,7 @@ class GraphClient:
     async def search_code(
         self,
         query: str,
+        *,
         limit: int = 10,
         entity_type: str | None = None,
         file_pattern: str | None = None,
@@ -613,10 +615,11 @@ class GraphClient:
     async def get_callers(
         self,
         method_name: str,
+        *,
         repository: str | None = None,
         file_path: str | None = None,
-        depth: int = 1,
         entity_id: str | None = None,
+        depth: int = 1,
         limit: int = 50,
     ) -> list[CallGraphNode]:
         """Find callers of a method using the current Constellation graph schema."""
@@ -668,10 +671,11 @@ class GraphClient:
     async def get_callees(
         self,
         method_name: str,
+        *,
         repository: str | None = None,
         file_path: str | None = None,
-        depth: int = 1,
         entity_id: str | None = None,
+        depth: int = 1,
         limit: int = 50,
     ) -> list[CallGraphNode]:
         """Find call targets and hook usage for a method."""
@@ -756,6 +760,7 @@ class GraphClient:
     async def get_function_context(
         self,
         method_name: str,
+        *,
         repository: str | None = None,
         file_path: str | None = None,
     ) -> FunctionContext | None:
@@ -802,6 +807,7 @@ class GraphClient:
     async def get_class_hierarchy(
         self,
         class_name: str,
+        *,
         repository: str | None = None,
         file_path: str | None = None,
     ) -> ClassHierarchy | None:
@@ -917,6 +923,7 @@ class GraphClient:
     async def get_package_context(
         self,
         package_name: str,
+        *,
         repository: str | None = None,
     ) -> PackageContext | None:
         """Return package or namespace membership information."""
@@ -1125,6 +1132,7 @@ class GraphClient:
     async def find_symbols(
         self,
         query: str,
+        *,
         entity_types: list[str] | None = None,
         repository: str | None = None,
         file_pattern: str | None = None,
@@ -1184,6 +1192,7 @@ class GraphClient:
     async def get_file_context(
         self,
         file_path: str,
+        *,
         repository: str | None = None,
     ) -> FileContext | None:
         """Get file-level graph context, including packages, exports, and hook usage."""
@@ -1289,6 +1298,7 @@ class GraphClient:
     async def get_hook_usage(
         self,
         hook_name: str,
+        *,
         repository: str | None = None,
         file_pattern: str | None = None,
         language: str | None = None,
@@ -1336,6 +1346,7 @@ class GraphClient:
     async def get_impact(
         self,
         method_name: str,
+        *,
         repository: str | None = None,
         file_path: str | None = None,
         depth: int = 10,

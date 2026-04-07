@@ -314,16 +314,16 @@ async def live_neo4j_driver():
 
 @pytest.fixture()
 async def live_graph_client():
-    """Create a real Telescope GraphClient against the local Neo4j instance."""
+    """Create a real Telescope Neo4jReadBackend against the local Neo4j instance."""
     _require_integration()
-    with patch("telescope.graph_client.get_config", return_value=_neo4j_config()), \
-         patch("telescope.graph_client.AsyncOpenAI") as mock_openai:
+    with patch("telescope.backends.neo4j.get_config", return_value=_neo4j_config()), \
+         patch("telescope.backends.neo4j.AsyncOpenAI") as mock_openai:
         mock_client = AsyncMock()
         mock_client.close = AsyncMock()
         mock_openai.return_value = mock_client
-        from telescope.graph_client import GraphClient
+        from telescope.backends.neo4j import Neo4jReadBackend
 
-        client = GraphClient()
+        client = Neo4jReadBackend()
         await client.connect()
         try:
             yield client

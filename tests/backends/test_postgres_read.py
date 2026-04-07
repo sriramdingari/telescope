@@ -329,6 +329,116 @@ async def test_get_file_context_populates_exports(backend, mock_pool):
     assert len(result.references) == 2
 
 
+@pytest.mark.asyncio
+async def test_get_codebase_overview_counts_exports(backend, mock_pool):
+    """get_codebase_overview must include an exports count via the EXPORTS
+    ref_type (matching Neo4j)."""
+    counts = [{"symbol_type": "File", "cnt": 5},
+              {"symbol_type": "Class", "cnt": 10}]
+    langs = [{"language": "python"}]
+    entry_points = []
+    top_classes = []
+    export_count = [{"cnt": 7}]
+
+    call_count = {"n": 0}
+    fetch_sequence = [counts, langs, entry_points, top_classes, export_count]
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_sequence[idx] if idx < len(fetch_sequence) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_codebase_overview(repository="repo")
+
+    assert result.total_exports == 7
+
+
+@pytest.mark.asyncio
+async def test_get_codebase_overview_include_packages_returns_names(backend, mock_pool):
+    """When include_packages=True, the overview must return package names."""
+    counts = []
+    langs = []
+    entry_points = []
+    top_classes = []
+    export_count = [{"cnt": 0}]
+    packages = [{"symbol_name": "com.example.app"}, {"symbol_name": "com.example.util"}]
+
+    call_count = {"n": 0}
+    fetch_sequence = [counts, langs, entry_points, top_classes, export_count, packages]
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_sequence[idx] if idx < len(fetch_sequence) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_codebase_overview(repository="repo", include_packages=True)
+
+    assert "com.example.app" in result.packages
+    assert "com.example.util" in result.packages
+
+
+@pytest.mark.asyncio
+async def test_get_package_context_populates_hooks_and_references(backend, mock_pool):
+    """get_package_context must populate hooks and references as direct
+    IN_PACKAGE members, not via a two-hop traversal. Matches Neo4j semantics."""
+    async def fake_resolve(*args, **kwargs):
+        return {"id": "repo::com.example", "symbol_name": "com.example",
+                "repository": "repo"}
+    backend._resolve_symbol = fake_resolve
+
+    # members query returns ALL direct IN_PACKAGE members including hooks and refs
+    members = [
+        {"symbol_name": "Foo", "symbol_type": "Class", "file_path": "Foo.java"},
+        {"symbol_name": "useAuth", "symbol_type": "Hook", "file_path": "useAuth.ts"},
+        {"symbol_name": "Logger", "symbol_type": "Reference", "file_path": "Logger.java"},
+    ]
+    child_pkgs: list = []
+
+    call_count = {"n": 0}
+    fetch_sequence = [members, child_pkgs]
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_sequence[idx] if idx < len(fetch_sequence) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_package_context("com.example")
+
+    # Direct IN_PACKAGE members are categorized by symbol_type
+    assert "useAuth" in result.hooks
+    assert "Logger" in result.references
+    assert "Foo" in result.classes
+
+    # Verify only 2 fetch calls were made (members + child_pkgs)
+    # No separate hooks or references queries — they come from the members row set
+    assert mock_pool.fetch.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_codebase_overview_no_repository_with_include_packages(backend, mock_pool):
+    """get_codebase_overview(repository=None, include_packages=True) must
+    return packages across all repositories."""
+    counts = []
+    langs = []
+    entry_points = []
+    top_classes = []
+    export_count = [{"cnt": 0}]
+    packages = [{"symbol_name": "repo1.pkg"}, {"symbol_name": "repo2.pkg"}]
+
+    call_count = {"n": 0}
+    fetch_sequence = [counts, langs, entry_points, top_classes, export_count, packages]
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_sequence[idx] if idx < len(fetch_sequence) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_codebase_overview(repository=None, include_packages=True)
+
+    assert "repo1.pkg" in result.packages
+    assert "repo2.pkg" in result.packages
+
+
 def test_looks_like_symbol_query_heuristic():
     """Mirrors neo4j.py:200 — identifies code-like tokens."""
     from telescope.backends.postgres import PostgresReadBackend as P

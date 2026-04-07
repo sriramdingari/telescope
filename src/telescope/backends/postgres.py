@@ -588,6 +588,9 @@ class PostgresReadBackend(ReadBackend):
         if not pkg:
             return None
 
+        # All direct IN_PACKAGE members (files, classes, interfaces, methods,
+        # hooks, references). The Neo4j backend uses the same direct-membership
+        # model at neo4j.py:942-954.
         members = await pool.fetch("""
             SELECT s.symbol_name, s.symbol_type, s.file_path
             FROM code_references r JOIN code_symbols s ON s.id = r.source_symbol_id
@@ -609,8 +612,8 @@ class PostgresReadBackend(ReadBackend):
             classes=[r["symbol_name"] for r in members if r["symbol_type"] == "Class"],
             interfaces=[r["symbol_name"] for r in members if r["symbol_type"] == "Interface"],
             methods=[r["symbol_name"] for r in members if r["symbol_type"] == "Method"],
-            hooks=[],
-            references=[],
+            hooks=[r["symbol_name"] for r in members if r["symbol_type"] == "Hook"],
+            references=[r["symbol_name"] for r in members if r["symbol_type"] == "Reference"],
             child_packages=[r["symbol_name"] for r in child_pkgs],
         )
 
@@ -887,7 +890,7 @@ class PostgresReadBackend(ReadBackend):
             total_packages=overview.total_packages,
             total_hooks=overview.total_hooks,
             total_references=overview.total_references,
-            total_exports=0,
+            total_exports=overview.total_exports,
             languages=overview.languages,
             top_level_classes=overview.top_level_classes,
             entry_points=overview.entry_points,
@@ -948,6 +951,37 @@ class PostgresReadBackend(ReadBackend):
                 LIMIT 20
             """)
 
+        # Exports count — number of EXPORTS relationships in the repository
+        if repository:
+            export_rows = await pool.fetch("""
+                SELECT COUNT(*) AS cnt FROM code_references r
+                JOIN code_symbols s ON s.id = r.source_symbol_id
+                WHERE s.repository = $1 AND r.ref_type = 'EXPORTS'
+            """, repository)
+        else:
+            export_rows = await pool.fetch("""
+                SELECT COUNT(*) AS cnt FROM code_references
+                WHERE ref_type = 'EXPORTS'
+            """)
+        total_exports = export_rows[0]["cnt"] if export_rows else 0
+
+        # Package names (only when include_packages=True to avoid an unnecessary query)
+        packages: list[str] = []
+        if include_packages:
+            if repository:
+                pkg_rows = await pool.fetch("""
+                    SELECT symbol_name FROM code_symbols
+                    WHERE symbol_type = 'Package' AND repository = $1
+                    ORDER BY symbol_name
+                """, repository)
+            else:
+                pkg_rows = await pool.fetch("""
+                    SELECT symbol_name FROM code_symbols
+                    WHERE symbol_type = 'Package'
+                    ORDER BY symbol_name
+                """)
+            packages = [r["symbol_name"] for r in pkg_rows]
+
         return CodebaseOverview(
             total_files=count_map.get("File", 0),
             total_classes=count_map.get("Class", 0),
@@ -958,7 +992,9 @@ class PostgresReadBackend(ReadBackend):
             total_packages=count_map.get("Package", 0),
             total_hooks=count_map.get("Hook", 0),
             total_references=count_map.get("Reference", 0),
+            total_exports=total_exports,
             languages=[r["language"] for r in langs if r["language"]],
+            packages=packages,
             top_level_classes=[r["symbol_name"] for r in top_classes],
             entry_points=[r["symbol_name"] for r in entry_points],
         )

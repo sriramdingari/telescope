@@ -710,10 +710,26 @@ class PostgresReadBackend(ReadBackend):
         if not symbol:
             return None
 
-        # Push the limit into the SQL when provided. Use a generous default
-        # cap to avoid materializing unbounded result sets.
-        sql_limit = limit if limit is not None else 10000
+        # Expand to the polymorphic method family (same as get_callers/get_callees)
+        family_ids = await self._resolve_method_family(symbol)
 
+        # Fetch the full transitive caller set WITHOUT the per-category LIMIT.
+        # The `limit` parameter is per-category (tests/endpoints/others) —
+        # applying it at the SQL level would conflate categories and
+        # produce undercounted totals.
+        #
+        # We cap at a safe maximum (10_000) to prevent runaway traversals
+        # on pathological graphs. Neo4j caps at 200 (neo4j.py:1378); we
+        # use a larger cap here because recursive CTEs are cheap and the
+        # per-category limit below still truncates the user-visible output.
+        # If a real codebase hits 10_000, the total_callers count accurately
+        # reflects that ceiling and the user can drill deeper via get_callers
+        # with a specific entity_id.
+        #
+        # Also: exclude family methods themselves from the caller set
+        # (a polymorphic override calling its own sibling shouldn't count
+        # as impact on itself). Mirrors Neo4j's `caller <> m` filter at
+        # neo4j.py:1370.
         rows = await pool.fetch("""
             WITH RECURSIVE callers AS (
                 SELECT s.id, s.symbol_name, s.file_path, s.repository,
@@ -721,7 +737,9 @@ class PostgresReadBackend(ReadBackend):
                        s.is_test, s.is_endpoint, 1 AS depth
                 FROM code_references r
                 JOIN code_symbols s ON s.id = r.source_symbol_id
-                WHERE r.target_symbol_id = $1 AND r.ref_type = 'CALLS'
+                WHERE r.target_symbol_id = ANY($1)
+                  AND r.ref_type = 'CALLS'
+                  AND s.id != ALL($1)
                 UNION
                 SELECT s.id, s.symbol_name, s.file_path, s.repository,
                        s.signature, s.line_start, s.symbol_type,
@@ -730,27 +748,41 @@ class PostgresReadBackend(ReadBackend):
                 JOIN code_symbols s ON s.id = r.source_symbol_id
                 JOIN callers c ON c.id = r.target_symbol_id
                 WHERE c.depth < $2
+                  AND s.id != ALL($1)
             )
             SELECT DISTINCT ON (id) * FROM callers ORDER BY id, depth
-            LIMIT $3
-        """, symbol["id"], depth, sql_limit + 1 if limit is not None else sql_limit)
+            LIMIT 10000
+        """, family_ids, depth)
 
-        rows_list = list(rows)
-        truncated = limit is not None and len(rows_list) > limit
-        if limit is not None:  # FIX: explicit None check, not truthiness
-            rows_list = rows_list[:limit]
+        # Categorize ALL rows (not truncated ones)
+        tests = [r for r in rows if r["is_test"]]
+        endpoints = [r for r in rows if r["is_endpoint"] and not r["is_test"]]
+        others = [r for r in rows if not r["is_test"] and not r["is_endpoint"]]
 
-        tests = [r for r in rows_list if r["is_test"]]
-        endpoints = [r for r in rows_list if r["is_endpoint"] and not r["is_test"]]
-        others = [r for r in rows_list if not r["is_test"] and not r["is_endpoint"]]
+        # True totals, before per-category truncation
+        total_callers = len(rows)
+        total_tests = len(tests)
+        total_endpoints = len(endpoints)
+
+        # Per-category limit truncation (matches Neo4j's behavior)
+        truncated = False
+        if limit is not None:
+            truncated = (
+                len(tests) > limit
+                or len(endpoints) > limit
+                or len(others) > limit
+            )
+            tests = tests[:limit]
+            endpoints = endpoints[:limit]
+            others = others[:limit]
 
         return ImpactResult(
             target_name=symbol["symbol_name"],
             target_file=symbol["file_path"],
             target_repository=symbol.get("repository"),
-            total_callers=len(rows_list),
-            test_count=len(tests),
-            endpoint_count=len(endpoints),
+            total_callers=total_callers,
+            test_count=total_tests,
+            endpoint_count=total_endpoints,
             affected_tests=[] if summary_only else [self._row_to_call_graph_node(dict(r)) for r in tests],
             affected_endpoints=[] if summary_only else [self._row_to_call_graph_node(dict(r)) for r in endpoints],
             other_callers=[] if summary_only else [self._row_to_call_graph_node(dict(r)) for r in others],

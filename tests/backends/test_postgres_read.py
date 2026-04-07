@@ -212,6 +212,70 @@ async def test_get_callees_uses_method_family_for_polymorphism(backend, mock_poo
 
 
 @pytest.mark.asyncio
+async def test_get_impact_counts_before_limit_truncation(backend, mock_pool):
+    """get_impact must compute total_callers/test_count/endpoint_count from
+    the full caller set, then truncate each category independently by limit."""
+    async def fake_resolve(*args, **kwargs):
+        return {"id": "repo::svc.doIt", "symbol_name": "doIt",
+                "file_path": "svc.py", "repository": "repo"}
+    backend._resolve_symbol = fake_resolve
+    backend._resolve_method_family = AsyncMock(return_value=["repo::svc.doIt"])
+
+    # Return 20 tests, 5 endpoints, 10 others = 35 total callers
+    all_rows = (
+        [{"id": f"t{i}", "symbol_name": f"test_{i}", "file_path": "test.py",
+          "repository": "repo", "signature": None, "line_start": i,
+          "symbol_type": "Method", "is_test": True, "is_endpoint": False,
+          "depth": 1} for i in range(20)]
+        + [{"id": f"e{i}", "symbol_name": f"endpoint_{i}", "file_path": "api.py",
+            "repository": "repo", "signature": None, "line_start": i,
+            "symbol_type": "Method", "is_test": False, "is_endpoint": True,
+            "depth": 1} for i in range(5)]
+        + [{"id": f"o{i}", "symbol_name": f"other_{i}", "file_path": "other.py",
+            "repository": "repo", "signature": None, "line_start": i,
+            "symbol_type": "Method", "is_test": False, "is_endpoint": False,
+            "depth": 1} for i in range(10)]
+    )
+    mock_pool.fetch = AsyncMock(return_value=all_rows)
+
+    result = await backend.get_impact("doIt", limit=3)
+
+    # Total counts reflect the FULL caller set, not the truncated ones
+    assert result.total_callers == 35
+    assert result.test_count == 20
+    assert result.endpoint_count == 5
+    # Each category truncated independently to limit=3
+    assert len(result.affected_tests) == 3
+    assert len(result.affected_endpoints) == 3
+    assert len(result.other_callers) == 3
+    # truncated is True because at least one category exceeded the limit
+    assert result.truncated is True
+
+
+@pytest.mark.asyncio
+async def test_get_impact_excludes_family_methods_from_callers(backend, mock_pool):
+    """A method calling a sibling override shouldn't count as impact on itself.
+    The recursive CTE must exclude family_ids from the caller set."""
+    async def fake_resolve(*args, **kwargs):
+        return {"id": "repo::FooImpl.doIt", "symbol_name": "doIt",
+                "file_path": "Foo.java", "repository": "repo"}
+    async def fake_family(symbol):
+        return ["repo::IFoo.doIt", "repo::FooImpl.doIt", "repo::FooSub.doIt"]
+
+    backend._resolve_symbol = fake_resolve
+    backend._resolve_method_family = fake_family
+    mock_pool.fetch = AsyncMock(return_value=[])
+
+    await backend.get_impact("doIt")
+
+    # Verify the SQL includes the s.id != ALL($1) exclusion
+    sql = mock_pool.fetch.call_args[0][0]
+    assert "ANY($1)" in sql, f"Expected ANY($1) for family matching; got SQL: {sql}"
+    assert "!= ALL($1)" in sql, \
+        f"Expected s.id != ALL($1) to exclude family from callers; got SQL: {sql}"
+
+
+@pytest.mark.asyncio
 async def test_get_file_context_populates_exports(backend, mock_pool):
     """get_file_context must actually return exports, not hardcode [] ."""
     # Mock pool.fetch to return different things for different queries in order:

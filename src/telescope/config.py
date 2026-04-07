@@ -17,6 +17,18 @@ class Config:
     storage_backend: str = "neo4j"
     postgres_dsn: str = ""
 
+    def __post_init__(self) -> None:
+        """Validate that postgres_dsn is set when storage_backend is postgres.
+
+        Fails fast at config construction instead of deferring to an opaque
+        asyncpg connection error when the factory tries to dial an empty DSN.
+        """
+        if self.storage_backend == "postgres" and not self.postgres_dsn:
+            raise ValueError(
+                "storage_backend='postgres' requires postgres_dsn to be set. "
+                "Example: postgresql://user:pass@host:5432/dbname"
+            )
+
     @classmethod
     def from_env(cls) -> "Config":
         """Create config from environment variables."""

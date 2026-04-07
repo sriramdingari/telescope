@@ -146,3 +146,43 @@ class TestGetConfig:
         assert cfg2.neo4j_user == "user_b"
 
         assert cfg1 is not cfg2
+
+
+def test_config_postgres_backend_requires_non_empty_dsn():
+    """storage_backend=postgres with empty postgres_dsn must raise."""
+    with pytest.raises(ValueError, match="postgres_dsn"):
+        Config(
+            neo4j_uri="bolt://localhost:7687",
+            neo4j_user="neo4j",
+            neo4j_password="pw",
+            openai_api_key="sk-test",
+            storage_backend="postgres",
+            postgres_dsn="",
+        )
+
+
+def test_config_postgres_backend_accepts_non_empty_dsn():
+    """storage_backend=postgres with a real DSN must construct cleanly."""
+    c = Config(
+        neo4j_uri="bolt://localhost:7687",
+        neo4j_user="neo4j",
+        neo4j_password="pw",
+        openai_api_key="sk-test",
+        storage_backend="postgres",
+        postgres_dsn="postgresql://u:p@host:5432/db",
+    )
+    assert c.storage_backend == "postgres"
+    assert c.postgres_dsn == "postgresql://u:p@host:5432/db"
+
+
+def test_config_neo4j_backend_does_not_require_postgres_dsn():
+    """storage_backend=neo4j must not require postgres_dsn."""
+    c = Config(
+        neo4j_uri="bolt://localhost:7687",
+        neo4j_user="neo4j",
+        neo4j_password="pw",
+        openai_api_key="sk-test",
+        storage_backend="neo4j",
+        postgres_dsn="",
+    )
+    assert c.storage_backend == "neo4j"

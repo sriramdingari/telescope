@@ -41,6 +41,17 @@ pip install .
 uvx --from git+https://github.com/sriramdingari/telescope.git telescope
 ```
 
+### Postgres Backend (Optional)
+
+By default, Telescope reads from Neo4j. To use a PostgreSQL + pgvector backend instead (e.g. if your Constellation instance is indexing into Postgres), set two environment variables:
+
+```bash
+export STORAGE_BACKEND=postgres
+export POSTGRES_DSN=postgresql://constellation:secret@localhost:5432/constellation
+```
+
+`asyncpg` and `pgvector` are shipped as default dependencies, so no extra install step is needed. The Postgres backend implements the same MCP tool contract as the Neo4j backend — all 13 tools (`search_code`, `get_callers`, `get_impact`, etc.) work identically.
+
 ## Setup with Claude Code
 
 Add Telescope as an MCP server in Claude Code:

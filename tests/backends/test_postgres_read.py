@@ -107,3 +107,57 @@ async def test_get_codebase_overview_returns_empty(backend, mock_pool):
     result = await backend.get_codebase_overview()
     assert result.total_files == 0
     assert result.total_classes == 0
+
+
+@pytest.mark.asyncio
+async def test_get_file_context_populates_exports(backend, mock_pool):
+    """get_file_context must actually return exports, not hardcode [] ."""
+    # Mock pool.fetch to return different things for different queries in order:
+    # 1. Initial file lookup (LIMIT 2)
+    # 2. Contained entities
+    # 3. Exports (full entity rows)
+    # 4. Packages (via IN_PACKAGE)
+    # 5. Hook usages
+    # 6. References (USES_TYPE)
+    file_row = {
+        "id": "repo::src/foo.py",
+        "symbol_name": "foo.py",
+        "file_path": "src/foo.py",
+        "repository": "repo",
+        "language": "python",
+        "content_hash": "h1",
+    }
+    fetch_results = [
+        [file_row],  # initial file lookup
+        [{"symbol_name": "MyClass", "symbol_type": "Class", "line_start": 1}],  # contained
+        [{"id": "repo::src/foo.py::helper",  # exports (full entity rows)
+          "symbol_name": "helper", "symbol_type": "Method",
+          "file_path": "src/foo.py", "repository": "repo",
+          "line_start": 5, "line_end": 10, "signature": "def helper()",
+          "code": "def helper(): pass", "docstring": None,
+          "language": "python", "return_type": None,
+          "modifiers": [], "stereotypes": [], "content_hash": "h1",
+          "properties": {}}],
+        [{"symbol_name": "com.example"}],  # packages (IN_PACKAGE)
+        [],  # hook_usages
+        [{"symbol_name": "SomeType"}, {"symbol_name": "AnotherType"}],  # references
+    ]
+    call_count = {"n": 0}
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_results[idx] if idx < len(fetch_results) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_file_context("src/foo.py")
+
+    assert result is not None
+    # exports must have the entity we returned — not []
+    assert len(result.exports) == 1
+    assert result.exports[0].name == "helper"
+    # packages must include the package we returned — not []
+    assert "com.example" in result.packages
+    # references must contain the Reference names we returned — not []
+    assert "SomeType" in result.references
+    assert "AnotherType" in result.references
+    assert len(result.references) == 2

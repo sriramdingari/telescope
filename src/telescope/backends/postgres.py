@@ -506,10 +506,25 @@ class PostgresReadBackend(ReadBackend):
             WHERE r.source_symbol_id = $1 AND r.ref_type = 'CONTAINS'
         """, file_sym["id"])
 
-        exports = await pool.fetch("""
-            SELECT s.symbol_name FROM code_references r
-            JOIN code_symbols s ON s.id = r.target_symbol_id
+        # Exports: return full CodeEntity objects (not just names), matching Neo4j contract
+        export_rows = await pool.fetch("""
+            SELECT s.*
+            FROM code_references r JOIN code_symbols s ON s.id = r.target_symbol_id
             WHERE r.source_symbol_id = $1 AND r.ref_type = 'EXPORTS'
+        """, file_sym["id"])
+
+        # Packages that this file belongs to (via IN_PACKAGE from file's contained symbols)
+        # A file belongs to any package its contained classes/methods are IN_PACKAGE of.
+        package_rows = await pool.fetch("""
+            SELECT DISTINCT pkg.symbol_name
+            FROM code_references r1
+            JOIN code_symbols contained ON contained.id = r1.target_symbol_id
+            JOIN code_references r2 ON r2.source_symbol_id = contained.id
+            JOIN code_symbols pkg ON pkg.id = r2.target_symbol_id
+            WHERE r1.source_symbol_id = $1
+              AND r1.ref_type = 'CONTAINS'
+              AND r2.ref_type = 'IN_PACKAGE'
+              AND pkg.symbol_type = 'Package'
         """, file_sym["id"])
 
         # USES_HOOK relationships are on Method/Constructor nodes, not File nodes.
@@ -526,21 +541,38 @@ class PostgresReadBackend(ReadBackend):
               AND r2.ref_type = 'USES_HOOK'
         """, file_sym["id"])
 
+        # References (Reference-type symbols used within the file, via USES_TYPE from contained members)
+        reference_rows = await pool.fetch("""
+            SELECT DISTINCT ref.symbol_name
+            FROM code_references r1
+            JOIN code_symbols contained ON contained.id = r1.target_symbol_id
+            JOIN code_references r2 ON r2.source_symbol_id = contained.id
+            JOIN code_symbols ref ON ref.id = r2.target_symbol_id
+            WHERE r1.source_symbol_id = $1
+              AND r1.ref_type = 'CONTAINS'
+              AND r2.ref_type = 'USES_TYPE'
+              AND ref.symbol_type = 'Reference'
+        """, file_sym["id"])
+
         return FileContext(
             name=file_sym["symbol_name"],
             file_path=file_sym["file_path"],
             repository=file_sym.get("repository"),
             language=file_sym.get("language"),
             content_hash=file_sym.get("content_hash"),
-            packages=[],
-            exports=[],
+            packages=[r["symbol_name"] for r in package_rows],
+            exports=[
+                self._row_to_code_entity(dict(r))
+                for r in export_rows
+                if r.get("symbol_name") and r.get("file_path")
+            ],
             classes=[r["symbol_name"] for r in contained if r["symbol_type"] == "Class"],
             interfaces=[r["symbol_name"] for r in contained if r["symbol_type"] == "Interface"],
             top_level_methods=[r["symbol_name"] for r in contained if r["symbol_type"] == "Method"],
             hooks=[r["symbol_name"] for r in hook_usages],
             constructors=[r["symbol_name"] for r in contained if r["symbol_type"] == "Constructor"],
             fields=[r["symbol_name"] for r in contained if r["symbol_type"] == "Field"],
-            references=[],
+            references=[r["symbol_name"] for r in reference_rows],
         )
 
     async def get_hook_usage(

@@ -439,6 +439,90 @@ async def test_get_codebase_overview_no_repository_with_include_packages(backend
     assert "repo2.pkg" in result.packages
 
 
+def test_full_name_from_id_strips_repository_prefix():
+    """_full_name_from_id strips 'repo::' from the entity id."""
+    from telescope.backends.postgres import PostgresReadBackend
+    assert PostgresReadBackend._full_name_from_id(
+        "my-repo::com.example.Foo.bar", "bar"
+    ) == "com.example.Foo.bar"
+    # Fallback: no '::' in id → use fallback_name
+    assert PostgresReadBackend._full_name_from_id("bar", "bar") == "bar"
+    # Empty id → fallback
+    assert PostgresReadBackend._full_name_from_id("", "bar") == "bar"
+
+
+@pytest.mark.asyncio
+async def test_get_function_context_populates_full_name_and_class_name(backend, mock_pool):
+    """get_function_context must strip the repo prefix from full_name and
+    look up the owning class_name."""
+    async def fake_resolve(*args, **kwargs):
+        return {
+            "id": "my-repo::com.example.Service.doIt",
+            "symbol_name": "doIt",
+            "file_path": "src/Service.java",
+            "repository": "my-repo",
+            "code": "public void doIt() {}",
+            "signature": "public void doIt()",
+            "docstring": None,
+        }
+    backend._resolve_symbol = fake_resolve
+
+    # First fetchrow call: class lookup returns the owning class
+    # Any subsequent fetchrow call: fail loudly (there should only be 1)
+    fetchrow_calls = {"count": 0}
+    async def fetchrow_side_effect(*args, **kwargs):
+        fetchrow_calls["count"] += 1
+        if fetchrow_calls["count"] == 1:
+            return {"symbol_name": "Service"}
+        raise AssertionError(
+            f"Unexpected fetchrow call #{fetchrow_calls['count']}: {args}"
+        )
+    mock_pool.fetchrow = AsyncMock(side_effect=fetchrow_side_effect)
+
+    # get_callers / get_callees short-circuit to []
+    backend.get_callers = AsyncMock(return_value=[])
+    backend.get_callees = AsyncMock(return_value=[])
+
+    result = await backend.get_function_context("doIt")
+
+    assert result is not None
+    assert result.full_name == "com.example.Service.doIt"
+    assert result.class_name == "Service"
+    # Verify the class lookup SQL received both symbol id AND repository
+    # as bind parameters (repository scoping from Fix 1)
+    fetchrow_args = mock_pool.fetchrow.call_args[0]
+    sql = fetchrow_args[0]
+    assert "s.repository = $2" in sql, \
+        f"Expected repository scoping in class lookup SQL; got: {sql}"
+    assert fetchrow_args[1] == "my-repo::com.example.Service.doIt"
+    assert fetchrow_args[2] == "my-repo"
+
+
+@pytest.mark.asyncio
+async def test_get_function_context_handles_missing_owning_class(backend, mock_pool):
+    """A top-level function (no owning class) should get class_name=None."""
+    async def fake_resolve(*args, **kwargs):
+        return {
+            "id": "my-repo::top_level_fn",
+            "symbol_name": "top_level_fn",
+            "file_path": "src/utils.py",
+            "repository": "my-repo",
+            "code": "def top_level_fn(): pass",
+            "signature": "def top_level_fn()",
+            "docstring": None,
+        }
+    backend._resolve_symbol = fake_resolve
+    mock_pool.fetchrow = AsyncMock(return_value=None)  # no owning class
+    backend.get_callers = AsyncMock(return_value=[])
+    backend.get_callees = AsyncMock(return_value=[])
+
+    result = await backend.get_function_context("top_level_fn")
+
+    assert result is not None
+    assert result.full_name == "top_level_fn"
+    assert result.class_name is None
+
+
 def test_looks_like_symbol_query_heuristic():
     """Mirrors neo4j.py:200 — identifies code-like tokens."""
     from telescope.backends.postgres import PostgresReadBackend as P

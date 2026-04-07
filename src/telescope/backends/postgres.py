@@ -216,6 +216,14 @@ class PostgresReadBackend(ReadBackend):
         )
 
     @staticmethod
+    def _full_name_from_id(entity_id: str, fallback_name: str) -> str:
+        """Strip the repository prefix from a Constellation entity id.
+        Mirrors neo4j.py:395."""
+        if "::" in entity_id:
+            return entity_id.split("::", 1)[1]
+        return fallback_name
+
+    @staticmethod
     def _looks_like_symbol_query(query: str) -> bool:
         """Heuristic: does this query look like a code identifier rather than
         a natural-language phrase? Mirrors neo4j.py:200.
@@ -494,6 +502,7 @@ class PostgresReadBackend(ReadBackend):
         repository: str | None = None,
         file_path: str | None = None,
     ) -> FunctionContext | None:
+        pool = self._require_pool()
         symbol = await self._resolve_symbol(
             method_name, repository=repository, file_path=file_path,
             entity_id=None, types=["Method", "Constructor"],
@@ -501,20 +510,36 @@ class PostgresReadBackend(ReadBackend):
         if not symbol:
             return None
 
-        callers = await self.get_callers(method_name, repository=repository,
-                                         file_path=file_path, depth=1)
-        callees = await self.get_callees(method_name, repository=repository,
-                                          file_path=file_path, depth=1)
+        # Look up the owning class via HAS_METHOD or HAS_CONSTRUCTOR.
+        # Scope by repository so cross-repo collisions with the same method
+        # name can't surface the wrong class.
+        class_row = await pool.fetchrow("""
+            SELECT s.symbol_name FROM code_references r
+            JOIN code_symbols s ON s.id = r.source_symbol_id
+            WHERE r.target_symbol_id = $1
+              AND r.ref_type IN ('HAS_METHOD', 'HAS_CONSTRUCTOR')
+              AND s.symbol_type IN ('Class', 'Interface')
+              AND s.repository = $2
+            LIMIT 1
+        """, symbol["id"], symbol.get("repository") or "")
+        class_name = class_row["symbol_name"] if class_row else None
+
+        callers = await self.get_callers(
+            method_name, repository=repository, file_path=file_path, depth=1,
+        )
+        callees = await self.get_callees(
+            method_name, repository=repository, file_path=file_path, depth=1,
+        )
 
         return FunctionContext(
             name=symbol["symbol_name"],
-            full_name=symbol["id"],
+            full_name=self._full_name_from_id(symbol["id"], symbol["symbol_name"]),
             file_path=symbol["file_path"],
             repository=symbol.get("repository"),
             code=symbol.get("code"),
             signature=symbol.get("signature"),
             docstring=symbol.get("docstring"),
-            class_name=None,
+            class_name=class_name,
             callers=callers,
             callees=callees,
         )
@@ -561,7 +586,7 @@ class PostgresReadBackend(ReadBackend):
 
         return ClassHierarchy(
             name=cls["symbol_name"],
-            full_name=cls["id"],
+            full_name=self._full_name_from_id(cls["id"], cls["symbol_name"]),
             file_path=cls["file_path"],
             repository=cls.get("repository"),
             is_interface=cls["symbol_type"] == "Interface",

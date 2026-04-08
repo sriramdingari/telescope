@@ -123,6 +123,20 @@ class PostgresReadBackend(ReadBackend):
 
         Mirrors Neo4j's resolver at neo4j.py:930.
 
+        Deliberate divergence from Neo4j's resolver: neo4j.py:930 uses
+        `(pkg.name = $package_name OR pkg.id ENDS WITH $suffix)`. We
+        intentionally drop the `symbol_name = $name` branch here because:
+
+        - For Java packages, symbol_name already contains the full dotted
+          name, so the suffix match subsumes the name match.
+        - For .NET nested namespaces, symbol_name is the leaf segment
+          only (e.g., "Services" for "Company.Product.Services"). The
+          name branch would silently match ANY namespace whose leaf
+          equals the query, producing wrong results for nested lookups
+          and inconsistent results for leaf-name lookups. Requiring the
+          caller to provide the full dotted name (or hit the LIMIT 2
+          ambiguity check) is strictly safer.
+
         Raises ValueError on ambiguity (multiple packages match the suffix).
         """
         pool = self._require_pool()
@@ -762,17 +776,15 @@ class PostgresReadBackend(ReadBackend):
               AND id LIKE $1 ESCAPE '\\'
               AND repository = $2
         """, child_prefix, pkg["repository"])
+        # Reconstruct the full dotted name from the ID for the returned name.
+        full_name = self._full_name_from_id(parent_id, pkg["symbol_name"])
         # Filter to immediate children: full_name parts = parent parts + 1
-        parent_full = self._full_name_from_id(parent_id, pkg["symbol_name"])
-        parent_depth = len(parent_full.split("."))
+        parent_depth = len(full_name.split("."))
         immediate_children: list[str] = []
         for r in child_rows:
             child_full = self._full_name_from_id(r["id"], r["symbol_name"])
             if len(child_full.split(".")) == parent_depth + 1:
                 immediate_children.append(child_full)
-
-        # Reconstruct the full dotted name from the ID for the returned name.
-        full_name = self._full_name_from_id(pkg["id"], pkg["symbol_name"])
 
         return PackageContext(
             name=full_name,
@@ -790,7 +802,7 @@ class PostgresReadBackend(ReadBackend):
             methods=[r["symbol_name"] for r in members if r["symbol_type"] == "Method"],
             hooks=[r["symbol_name"] for r in members if r["symbol_type"] == "Hook"],
             references=[r["symbol_name"] for r in members if r["symbol_type"] == "Reference"],
-            child_packages=immediate_children,
+            child_packages=sorted(set(immediate_children)),
         )
 
     async def get_file_context(

@@ -79,8 +79,14 @@ class TestPostgresContractHappyPaths:
         self, pg_read_backend, seeded_postgres_contract_repository,
     ):
         repository = seeded_postgres_contract_repository
+        # Pass the relative-suffix the user would naturally type. Constellation
+        # stores absolute paths (e.g. /abs/.../src/java/com/example/Service.java),
+        # so the resolver must do a suffix match — mirrors Neo4j's
+        # `f.file_path ENDS WITH $file_path` (neo4j.py:484) and the Neo4j
+        # contract test at test_contract_integration.py:58 which passes
+        # "Service.java".
         fc = await pg_read_backend.get_file_context(
-            "src/Service.java", repository=repository,
+            "Service.java", repository=repository,
         )
         assert fc is not None
         assert "Service" in fc.classes

@@ -868,24 +868,37 @@ class PostgresReadBackend(ReadBackend):
         repository: str | None = None,
     ) -> FileContext | None:
         pool = self._require_pool()
-        # Query on file_path column directly — _resolve_symbol matches symbol_name
-        # Use LIMIT 2 + ValueError on ambiguity, consistent with _resolve_symbol's contract
-        conditions = ["file_path = $1", "symbol_type = 'File'"]
+        # Suffix match on file_path + LIMIT 2 ambiguity detection.
+        # Mirrors Neo4j's _resolve_file_target at neo4j.py:484, which uses
+        # `f.file_path ENDS WITH $file_path`. Constellation stores absolute
+        # file paths, but callers commonly pass relative suffixes like
+        # "src/Service.java" — so we need suffix matching, not equality.
+        #
+        # We use right()+length() instead of LIKE to avoid pattern
+        # metacharacter issues: file paths on some filesystems can contain
+        # '_' or '%' which LIKE would interpret as wildcards. right() is
+        # a literal ends-with check. Same approach as the method-family
+        # suffix filter in _resolve_method_family.
+        conditions = [
+            "symbol_type = 'File'",
+            "right(file_path, length($1)) = $1",
+        ]
         params: list[Any] = [file_path]
         if repository:
             params.append(repository)
             conditions.append(f"repository = ${len(params)}")
         rows = await pool.fetch(
-            f"SELECT * FROM code_symbols WHERE {' AND '.join(conditions)} LIMIT 2",
+            f"SELECT * FROM code_symbols WHERE {' AND '.join(conditions)} "
+            f"ORDER BY file_path LIMIT 2",
             *params,
         )
         if not rows:
             return None
         if len(rows) > 1:
-            repos = [r["repository"] for r in rows]
+            examples = ", ".join(r.get("file_path") or "?" for r in rows)
             raise ValueError(
-                f"Ambiguous file path {file_path!r} — found in repos: {repos}. "
-                f"Provide repository= to disambiguate."
+                f"Ambiguous file path {file_path!r} — matches multiple files: "
+                f"{examples}. Provide repository= or a longer path suffix to disambiguate."
             )
         file_sym = dict(rows[0])
 

@@ -1284,3 +1284,96 @@ async def test_connect_registers_jsonb_codec_alongside_pgvector(monkeypatch):
         f"JSONB codec must decode via json.loads; got decoder={kwargs.get('decoder')}"
     assert kwargs.get("schema") == "pg_catalog", \
         f"JSONB codec should be scoped to pg_catalog.jsonb; got schema={kwargs.get('schema')}"
+
+
+@pytest.mark.asyncio
+async def test_get_file_context_resolves_absolute_path_by_suffix(backend, mock_pool):
+    """When Constellation stores absolute paths but the user passes a
+    relative suffix, get_file_context must resolve via suffix match.
+    Mirrors Neo4j's f.file_path ENDS WITH $file_path at neo4j.py:484.
+    A regression that reverts to `file_path = $1` would break every
+    contract test because Constellation stores absolute paths."""
+    # Constellation stores the absolute path; user passes the relative suffix
+    absolute_path = "/abs/repo/src/Service.java"
+    resolved_row = {
+        "id": "repo::File::/abs/repo/src/Service.java",
+        "symbol_name": "Service.java",
+        "file_path": absolute_path,
+        "symbol_type": "File",
+        "repository": "repo",
+        "content_hash": "abc",
+        "language": "java",
+    }
+
+    # Simulate the SQL filter: only return rows whose file_path ends with
+    # the bind value. A buggy `file_path = $1` implementation would return
+    # an empty list here (no exact match) and the test would fail.
+    call_count = {"n": 0}
+
+    async def fetch_side_effect(sql, *args):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        if idx == 0:
+            # First call: resolver. Must use right()/length() or some
+            # suffix-matching SQL, NOT exact equality.
+            assert "right(file_path" in sql or "RIGHT(file_path" in sql or "ENDS" in sql, \
+                f"Expected suffix-matching SQL in get_file_context resolver; got: {sql}"
+            # The first bind is the user-provided suffix
+            suffix = args[0]
+            # Simulate the filter behavior
+            if absolute_path.endswith(suffix):
+                return [resolved_row]
+            return []
+        # Downstream queries (contained, exports, packages, hooks, references)
+        # — empty results are fine for this test; we only care that the
+        # resolver succeeded and returned a FileContext.
+        return []
+
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_file_context("src/Service.java")
+
+    # Should have resolved and returned a FileContext
+    assert result is not None, \
+        "get_file_context must resolve an absolute path by suffix match"
+
+
+@pytest.mark.asyncio
+async def test_get_file_context_raises_on_ambiguous_suffix(backend, mock_pool):
+    """When multiple files match the suffix, must raise ValueError with
+    an actionable message that mentions the matching repositories.
+    LIMIT 2 + raise pattern matches Neo4j's behavior at neo4j.py:502."""
+    row1 = {
+        "id": "repo1::File::/a/src/util.py",
+        "symbol_name": "util.py",
+        "file_path": "/a/src/util.py",
+        "symbol_type": "File",
+        "repository": "repo1",
+    }
+    row2 = {
+        "id": "repo2::File::/b/src/util.py",
+        "symbol_name": "util.py",
+        "file_path": "/b/src/util.py",
+        "symbol_type": "File",
+        "repository": "repo2",
+    }
+
+    async def fetch_side_effect(sql, *args):
+        # Return both rows — simulating LIMIT 2 fetch that found 2 matches
+        return [row1, row2]
+
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    with pytest.raises(ValueError, match=r"[Aa]mbiguous"):
+        await backend.get_file_context("util.py")
+
+
+@pytest.mark.asyncio
+async def test_get_file_context_returns_none_when_no_match(backend, mock_pool):
+    """When no file matches the suffix, return None (not raise).
+    Matches Neo4j's `if not results: return None` at neo4j.py:500."""
+    mock_pool.fetch = AsyncMock(return_value=[])
+
+    result = await backend.get_file_context("nonexistent/path.py")
+
+    assert result is None

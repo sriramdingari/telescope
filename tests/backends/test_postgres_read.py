@@ -1385,3 +1385,44 @@ async def test_get_file_context_returns_none_when_no_match(backend, mock_pool):
     result = await backend.get_file_context("nonexistent/path.py")
 
     assert result is None
+
+
+@pytest.mark.postgres_integration
+async def test_seeded_postgres_fixture_uses_relative_file_paths(
+    seeded_postgres_contract_repository,
+    postgres_dsn,
+):
+    """Regression guard for contract-fixture normalization.
+
+    Production's IndexingPipeline normalizes parser-emitted absolute
+    file_paths to repository-relative paths via _normalize_parse_result
+    (constellation/indexer/pipeline.py:352). The contract fixtures used
+    to skip this step and seed absolute paths, which meant the contract
+    suite validated a parser-shaped graph instead of the production
+    graph.
+
+    This test connects directly to the seeded Postgres container and
+    asserts that no stored file_path starts with '/' — i.e., every
+    file_path has been rewritten from absolute to relative. Any Class,
+    Method, or File row with a leading-slash file_path indicates the
+    fixture is not running normalization.
+    """
+    import asyncpg
+    repository = seeded_postgres_contract_repository
+
+    conn = await asyncpg.connect(postgres_dsn)
+    try:
+        rows = await conn.fetch(
+            "SELECT id, symbol_type, file_path FROM code_symbols "
+            "WHERE repository = $1 AND file_path IS NOT NULL "
+            "AND file_path LIKE '/%'",
+            repository,
+        )
+    finally:
+        await conn.close()
+
+    assert rows == [], (
+        f"Expected all file_paths to be relative (normalized), but found "
+        f"{len(rows)} rows with absolute paths. Examples: "
+        f"{[(r['id'], r['file_path']) for r in rows[:3]]}"
+    )

@@ -458,6 +458,8 @@ from pathlib import Path
 sys.path.insert(0, {str(_constellation_root())!r})
 
 from constellation.graph.postgres import PostgresWriteBackend
+from constellation.indexer.pipeline import IndexingPipeline
+from constellation.models import CodeEntity, EntityType
 from constellation.parsers.registry import get_default_registry
 
 
@@ -468,25 +470,67 @@ async def main() -> None:
 
     entities = []
     relationships = []
+    reindex_preps = {{}}  # relative_path -> set[entity_id]
     errors = []
 
     for file_path in sorted(path for path in root.rglob('*') if path.is_file()):
         parser = registry.get_parser_for_file(file_path)
         if parser is None:
             continue
-        result = parser.parse_file(file_path, repository)
-        errors.extend(result.errors)
-        entities.extend(result.entities)
-        relationships.extend(result.relationships)
+        parse_result = parser.parse_file(file_path, repository)
+        errors.extend(parse_result.errors)
+
+        # Mirror IndexingPipeline lines 177-270: derive the canonical
+        # relative path and file_entity_id, run the production
+        # normalization step, then create the canonical File entity the
+        # pipeline would have created (the parser's File entity is
+        # dropped by _normalize_parse_result).
+        relative_path = str(file_path.relative_to(root))
+        file_entity_id = f"{{repository}}::{{relative_path}}"
+
+        # Static method — no pipeline instance needed. Returns
+        # (normalized_entities, normalized_relationships) with non-File
+        # entities having repo-relative file_paths, Python/JavaScript
+        # entity IDs remapped to the scoped-ID map, and CALLS target IDs
+        # resolved via call_aliases. See
+        # constellation/indexer/pipeline.py:325-380.
+        normalized_entities, normalized_relationships = (
+            IndexingPipeline._normalize_parse_result(
+                parse_result=parse_result,
+                relative_path=relative_path,
+                file_entity_id=file_entity_id,
+                language=parser.language,
+            )
+        )
+
+        # Canonical File entity, mirroring pipeline.py:252-262. We pass
+        # content_hash=None because the contract fixture doesn't need
+        # hash-based change detection (code_symbols.content_hash is
+        # nullable; get_file_hashes filters WHERE content_hash IS NOT
+        # NULL, so a NULL hash just means "no cached hash" — not a
+        # corrupt row).
+        file_entity = CodeEntity(
+            id=file_entity_id,
+            name=file_path.name,
+            entity_type=EntityType.FILE,
+            repository=repository,
+            file_path=relative_path,
+            line_number=1,
+            language=parser.language,
+            content_hash=None,
+        )
+
+        entities.append(file_entity)
+        entities.extend(normalized_entities)
+        relationships.extend(normalized_relationships)
+
+        reindex_preps[relative_path] = (
+            {{file_entity_id}}
+            | {{entity.id for entity in normalized_entities}}
+        )
 
     if errors:
         raise SystemExit('\\n'.join(errors))
-
-    # Group entity ids by file_path, matching how the real pipeline
-    # builds reindex_preparations (see constellation/indexer/pipeline.py).
-    reindex_preps: dict[str, set[str]] = defaultdict(set)
-    for entity in entities:
-        reindex_preps[entity.file_path].add(entity.id)
 
     backend = PostgresWriteBackend(
         dsn={postgres_dsn!r},

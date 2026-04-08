@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+import pytest_asyncio
 from neo4j import AsyncGraphDatabase
 
 from telescope.config import Config
@@ -342,3 +343,205 @@ async def seeded_contract_repository(live_neo4j_driver):
         yield repository
     finally:
         await _delete_repository_graph(live_neo4j_driver, repository)
+
+
+# ── Postgres contract-test fixtures (session-scoped) ─────────────────
+
+# Lazy import: testcontainers is only needed for postgres_integration tests.
+# If it's not installed OR Docker is unavailable, the fixture skips.
+_postgres_container_class = None
+_postgres_import_error: str | None = None
+try:
+    from testcontainers.postgres import PostgresContainer as _postgres_container_class
+except ImportError as exc:
+    _postgres_import_error = f"testcontainers not installed: {exc}"
+
+
+@pytest.fixture(scope="session")
+def postgres_container():
+    """Session-scoped pgvector container. Starts once, tears down at session end.
+
+    Gracefully skips postgres_integration tests if testcontainers is
+    missing OR Docker isn't available.
+
+    Bootstraps the pgvector extension once after the container starts.
+    This is database-engine setup (not Constellation-owned schema), and
+    mirrors what Constellation's PostgresWriteBackend.connect() does
+    before creating its own pool. Without this, Telescope's
+    PostgresReadBackend.connect() races against the seeding subprocess
+    when pytest resolves pg_read_backend before
+    seeded_postgres_contract_repository.
+    """
+    if _postgres_container_class is None:
+        pytest.skip(_postgres_import_error)
+    try:
+        container = _postgres_container_class(
+            image="pgvector/pgvector:pg16",
+            username="telescope",
+            password="telescope",
+            dbname="telescope",
+        )
+        container.start()
+    except Exception as exc:
+        pytest.skip(f"Docker unavailable for postgres contract tests: {exc}")
+
+    # Bootstrap pgvector extension via asyncpg (already a Telescope dep).
+    # We run a one-off event loop just for this connection.
+    try:
+        import asyncio
+        import asyncpg
+
+        raw_url = container.get_connection_url()
+        bootstrap_dsn = raw_url.replace("postgresql+psycopg2://", "postgresql://")
+
+        async def _bootstrap_extension() -> None:
+            conn = await asyncpg.connect(bootstrap_dsn)
+            try:
+                await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            finally:
+                await conn.close()
+
+        asyncio.run(_bootstrap_extension())
+    except Exception as exc:
+        container.stop()
+        pytest.skip(f"Failed to bootstrap pgvector extension: {exc}")
+
+    yield container
+    container.stop()
+
+
+@pytest.fixture
+def postgres_dsn(postgres_container):
+    """asyncpg-compatible DSN for the running session container."""
+    raw = postgres_container.get_connection_url()
+    # testcontainers returns psycopg2-style URLs; normalize to asyncpg's form
+    return raw.replace("postgresql+psycopg2://", "postgresql://")
+
+
+def _seed_constellation_postgres_fixture(postgres_dsn: str, repository: str) -> None:
+    """Parse the contract fixture repo with Constellation and load the
+    result into Postgres via Constellation's real PostgresWriteBackend.
+
+    Runs inside Constellation's own Python environment (via
+    _constellation_python()) so we get Constellation's real parsers,
+    schema DDL, and PostgresWriteBackend without Telescope having to
+    import or duplicate any of them.
+
+    Schema is created by Constellation's initialize_schema(); entities
+    and relationships are written via apply_indexing_changes(), which
+    is the exact code path production indexing uses.
+    """
+    script = f"""
+import asyncio
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+sys.path.insert(0, {str(_constellation_root())!r})
+
+from constellation.graph.postgres import PostgresWriteBackend
+from constellation.parsers.registry import get_default_registry
+
+
+async def main() -> None:
+    registry = get_default_registry()
+    root = Path({str(CONTRACT_FIXTURE_ROOT)!r})
+    repository = {repository!r}
+
+    entities = []
+    relationships = []
+    errors = []
+
+    for file_path in sorted(path for path in root.rglob('*') if path.is_file()):
+        parser = registry.get_parser_for_file(file_path)
+        if parser is None:
+            continue
+        result = parser.parse_file(file_path, repository)
+        errors.extend(result.errors)
+        entities.extend(result.entities)
+        relationships.extend(result.relationships)
+
+    if errors:
+        raise SystemExit('\\n'.join(errors))
+
+    # Group entity ids by file_path, matching how the real pipeline
+    # builds reindex_preparations (see constellation/indexer/pipeline.py).
+    reindex_preps: dict[str, set[str]] = defaultdict(set)
+    for entity in entities:
+        reindex_preps[entity.file_path].add(entity.id)
+
+    backend = PostgresWriteBackend(
+        dsn={postgres_dsn!r},
+        embedding_dimensions=1536,
+        embedding_model='text-embedding-3-small',
+    )
+    await backend.connect()
+    try:
+        await backend.initialize_schema()
+        # Idempotent: delete any prior data for this repository before
+        # loading the fresh parse. delete_repository cascades through
+        # code_symbols, code_references, and code_embeddings.
+        await backend.delete_repository(repository)
+        await backend.apply_indexing_changes(
+            repository=repository,
+            source=str(root),
+            commit_sha=None,
+            reindex_preparations=list(reindex_preps.items()),
+            entities=entities,
+            relationships=relationships,
+            stale_file_paths=[],
+        )
+    finally:
+        await backend.close()
+
+
+asyncio.run(main())
+"""
+    subprocess.run(
+        [str(_constellation_python()), "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+async def _delete_repository_postgres(postgres_dsn: str, repository: str) -> None:
+    """Remove a repository's rows from Postgres. Runs in Telescope's own
+    Python because it only needs asyncpg (already a Telescope dep).
+
+    Idempotent — safe to call even if the repository doesn't exist.
+    """
+    import asyncpg
+    conn = await asyncpg.connect(postgres_dsn)
+    try:
+        await conn.execute(
+            "DELETE FROM code_symbols WHERE repository = $1", repository
+        )
+        await conn.execute(
+            "DELETE FROM code_repos WHERE name = $1", repository
+        )
+    finally:
+        await conn.close()
+
+
+@pytest_asyncio.fixture
+async def seeded_postgres_contract_repository(postgres_dsn):
+    """Seed the session-scoped pgvector container with the contract fixture
+    repo (parsed by Constellation's real parsers and loaded via
+    Constellation's real PostgresWriteBackend). Yields a unique repository
+    name and cleans up afterward.
+
+    Mirrors the Neo4j contract pattern at conftest.py:228 but uses
+    Constellation's Postgres write path instead of raw Cypher.
+    """
+    import uuid
+    repository = f"telescope-postgres-contract-{uuid.uuid4().hex[:8]}"
+    _seed_constellation_postgres_fixture(postgres_dsn, repository)
+    try:
+        yield repository
+    finally:
+        # Best-effort cleanup; test failures are the real signal
+        try:
+            await _delete_repository_postgres(postgres_dsn, repository)
+        except Exception:
+            pass

@@ -242,7 +242,7 @@ class PostgresReadBackend(ReadBackend):
         return any(char.isupper() for char in stripped[1:])
 
     @staticmethod
-    def _apply_code_mode(entities: list["CodeEntity"], code_mode: str) -> None:
+    def _apply_code_mode(entities: list[CodeEntity], code_mode: str) -> None:
         """Mutate entities to reflect the requested code_mode.
 
         - "none": zero out the code field
@@ -250,7 +250,15 @@ class PostgresReadBackend(ReadBackend):
         - "preview": keep only the first 10 lines of code
         - anything else: leave code unchanged
 
-        Mirrors neo4j.py's code mode handling at lines 552, 598.
+        Inspired by neo4j.py's process_code (neo4j.py:552) and its
+        search_code merge loop (neo4j.py:598). Note: the Postgres
+        preview branch is a simple ``splitlines()[:10]`` slice and does
+        NOT match neo4j.py exactly — neo4j appends a ``"... (truncated)"``
+        marker when it truncates, falls back to ``signature`` when ``code``
+        is empty/None, and splits on ``"\\n"`` rather than using
+        ``splitlines()`` (so ``\\r\\n`` is handled differently). Aligning
+        the two is a separate task (not Task 1's scope); this helper
+        preserves the pre-existing Postgres behavior verbatim.
         """
         if code_mode == "none":
             for e in entities:

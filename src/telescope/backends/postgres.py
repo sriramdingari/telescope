@@ -168,23 +168,52 @@ class PostgresReadBackend(ReadBackend):
             )
         return dict(rows[0])
 
+    @staticmethod
+    def _parameter_suffix_from_entity_id(entity_id: str) -> str | None:
+        """Extract the parameter suffix (e.g. '(String,int)') from a
+        Constellation entity id.
+
+        Java and C# parsers include the parameter list in the method id
+        to disambiguate overloads. Python and JavaScript do not, so the
+        id has no suffix. Returns None for languages without parameter
+        suffixes, the suffix (including parens) otherwise.
+
+        The approach mirrors Neo4j's _parameter_suffix_from_entity_id:
+        find the last '(' in the id, and if the id ends with ')', everything
+        from that '(' onward is the parameter suffix. This works for:
+        - Methods on classes:  "repo::com.example.Foo.process(String,int)"
+        - Top-level functions: "repo::process(String)"
+        - Parameterless:       "repo::Foo.run()"
+
+        And correctly rejects:
+        - Python/JS (no suffix):           "repo::com.example.Foo.process"
+        - Parens in the middle only:       "repo::com.example.Foo(inner).method"
+        """
+        if not entity_id or not entity_id.endswith(")"):
+            return None
+        open_idx = entity_id.rfind("(")
+        if open_idx < 0:
+            return None
+        return entity_id[open_idx:]
+
     async def _resolve_method_family(self, symbol: dict) -> list[str]:
         """Return the list of method IDs that form the polymorphic family
         of the given method: the method itself plus all sibling overrides
         on classes/interfaces related via IMPLEMENTS/EXTENDS (up to 3 hops
         in either direction).
 
-        Mirrors Neo4j's _method_family_fragment. The returned list is used
-        as the starting set for get_callers/get_callees/get_impact recursive
-        traversals, so polymorphic edges are followed correctly.
+        If the starting method has a parameter suffix (Java/C# overloads),
+        candidates are filtered to methods with the same suffix —
+        ensuring callers/callees of the wrong overload don't pollute
+        the family set.
 
-        KNOWN GAP: Neo4j's family fragment also filters by `parameter_suffix`
-        to disambiguate overloaded methods (same name, different signatures).
-        This port returns ALL same-name methods, which is a permissive
-        superset of the correct answer — callers of ANY overload appear.
-        Overload disambiguation is deferred to a follow-up.
+        Mirrors Neo4j's _method_family_fragment at neo4j.py:451-476.
+        The returned list is used as the starting set for
+        get_callers/get_callees/get_impact recursive traversals, so
+        polymorphic edges are followed correctly.
         """
         pool = self._require_pool()
+        parameter_suffix = self._parameter_suffix_from_entity_id(symbol["id"])
 
         rows = await pool.fetch("""
             WITH RECURSIVE
@@ -226,7 +255,15 @@ class PostgresReadBackend(ReadBackend):
                 UNION
                 SELECT id FROM down_chain
             )
-            -- 5. Find all same-name methods on those owners
+            -- 5. Find all same-name methods on those owners, filtered by
+            -- parameter suffix (if present) to disambiguate overloaded
+            -- methods in Java/C#.
+            --
+            -- Suffix filter: m.id must END WITH symbol_name + parameter_suffix.
+            -- We use the right() function so pattern metacharacters in the
+            -- name (e.g., underscore in Python-style names — unlikely in
+            -- Java/C# but defensive) can't produce false matches. This is
+            -- a literal ends-with check with no pattern interpretation.
             SELECT DISTINCT m.id
             FROM code_references r
             JOIN code_symbols m ON m.id = r.target_symbol_id
@@ -234,7 +271,11 @@ class PostgresReadBackend(ReadBackend):
             WHERE r.ref_type IN ('HAS_METHOD', 'HAS_CONSTRUCTOR')
               AND m.symbol_name = $2
               AND m.symbol_type IN ('Method', 'Constructor')
-        """, symbol["id"], symbol["symbol_name"])
+              AND (
+                  $3::text IS NULL
+                  OR right(m.id, length($2 || $3::text)) = ($2 || $3::text)
+              )
+        """, symbol["id"], symbol["symbol_name"], parameter_suffix)
 
         family_ids = [r["id"] for r in rows]
         # Always include the starting symbol, even if it has no owner (top-level fn)

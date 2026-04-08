@@ -135,6 +135,145 @@ async def test_resolve_method_family_returns_overrides(backend, mock_pool):
         f"Expected symbol_name as $2, got {call_args[2]}"
 
 
+def test_parameter_suffix_from_entity_id_extracts_suffix():
+    """The helper must extract the parameter suffix from a Java/C# entity id.
+
+    Mirrors Neo4j's helper (neo4j.py:~402-409). Takes ONLY the entity_id —
+    no method_name argument needed, because we just look for the trailing
+    parenthesized tail.
+    """
+    from telescope.backends.postgres import PostgresReadBackend as P
+
+    # Java overloaded method on a class
+    assert P._parameter_suffix_from_entity_id(
+        "repo::com.example.Foo.process(String,int)"
+    ) == "(String,int)"
+
+    # Parameterless method
+    assert P._parameter_suffix_from_entity_id(
+        "repo::com.example.Foo.process()"
+    ) == "()"
+
+    # ID with no suffix (Python, JavaScript — no overloading): returns None
+    assert P._parameter_suffix_from_entity_id(
+        "repo::com.example.Foo.process"
+    ) is None
+
+    # Top-level function in Java/C# (no class): still has a suffix
+    assert P._parameter_suffix_from_entity_id(
+        "repo::process(String)"
+    ) == "(String)"
+
+    # Empty id
+    assert P._parameter_suffix_from_entity_id("") is None
+
+    # Id with parens in the middle but not at the end
+    assert P._parameter_suffix_from_entity_id(
+        "repo::com.example.Foo(inner).method"
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_method_family_filters_by_parameter_suffix(backend, mock_pool):
+    """When the starting method has a parameter suffix, the family query
+    must filter sibling methods to those with the SAME suffix. Otherwise
+    overloaded methods pollute the family set.
+
+    This test simulates the SQL filter behavior inside the mock's
+    side_effect: it inspects the bind parameters and returns only rows
+    whose id actually satisfies the right()/length() end-with check.
+    A buggy implementation that passes the wrong suffix, omits the
+    filter clause, or uses `LIKE` without escaping would produce the
+    wrong set of family_ids and fail the assertions."""
+    # Starting symbol has suffix "(String,int)"
+    symbol = {
+        "id": "repo::FooImpl.process(String,int)",
+        "symbol_name": "process",
+    }
+
+    # The "database" contains both overloads on both Foo and FooImpl.
+    # The filter should return only rows ending in process(String,int).
+    all_overload_rows = [
+        {"id": "repo::IFoo.process(String,int)"},
+        {"id": "repo::IFoo.process(String)"},            # wrong overload
+        {"id": "repo::FooImpl.process(String,int)"},
+        {"id": "repo::FooImpl.process(String)"},         # wrong overload
+        {"id": "repo::FooSub.process(String,int)"},
+        {"id": "repo::FooSub.process(String)"},          # wrong overload
+    ]
+
+    async def fetch_side_effect(sql, *args):
+        # args: (symbol_id, symbol_name, parameter_suffix)
+        assert len(args) == 3, f"Expected 3 args; got {len(args)}"
+        name = args[1]
+        suffix = args[2]
+        # Verify the SQL uses the right()/length() end-with check, NOT LIKE
+        assert "right(m.id" in sql or "RIGHT(m.id" in sql, \
+            f"Expected right(m.id, ...) suffix filter; got: {sql}"
+        assert "LIKE" not in sql or "'%::'" in sql, \
+            f"Expected end-with via right(), not LIKE pattern; got: {sql}"
+
+        # Simulate the SQL filter behavior
+        if suffix is None:
+            return all_overload_rows
+        target_tail = name + suffix
+        return [r for r in all_overload_rows if r["id"].endswith(target_tail)]
+
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    family_ids = await backend._resolve_method_family(symbol)
+
+    # MUST contain only the matching overload's ids
+    expected = {
+        "repo::IFoo.process(String,int)",
+        "repo::FooImpl.process(String,int)",
+        "repo::FooSub.process(String,int)",
+    }
+    # The starting symbol is always appended if missing (helper contract)
+    assert set(family_ids) >= expected, \
+        f"Expected family to contain matching overloads; got: {family_ids}"
+    # MUST NOT contain any wrong-overload ids
+    wrong = {
+        "repo::IFoo.process(String)",
+        "repo::FooImpl.process(String)",
+        "repo::FooSub.process(String)",
+    }
+    assert not (set(family_ids) & wrong), \
+        f"Family should exclude wrong overloads; got: {family_ids}"
+
+
+@pytest.mark.asyncio
+async def test_resolve_method_family_no_filter_when_suffix_absent(backend, mock_pool):
+    """Python-style IDs with no parameter suffix should match all same-name
+    methods (no overload filter applied). The mock simulates the SQL
+    behavior: when $3 is None, all rows are returned regardless of suffix."""
+    symbol = {
+        "id": "repo::foo.bar",  # no suffix
+        "symbol_name": "bar",
+    }
+
+    all_rows = [
+        {"id": "repo::Foo.bar"},
+        {"id": "repo::FooSub.bar"},
+    ]
+
+    async def fetch_side_effect(sql, *args):
+        assert len(args) == 3
+        name = args[1]
+        suffix = args[2]
+        assert suffix is None, \
+            f"Expected parameter_suffix=None for Python-style ID; got: {suffix}"
+        return all_rows
+
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    family_ids = await backend._resolve_method_family(symbol)
+
+    # Both same-name methods should be included (no suffix filter)
+    assert "repo::Foo.bar" in family_ids
+    assert "repo::FooSub.bar" in family_ids
+
+
 @pytest.mark.asyncio
 async def test_get_callers_uses_method_family_for_polymorphism(backend, mock_pool):
     """get_callers must pass the full method family to the recursive CTE

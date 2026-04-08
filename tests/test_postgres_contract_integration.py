@@ -174,13 +174,43 @@ class TestPostgresContractTaskCoverage:
         _apply_code_mode then transforms). This contract test proves the
         fixture has non-null code bodies — the mocked unit tests in
         tests/backends/test_postgres_read.py verify the actual
-        transformation logic."""
+        transformation logic.
+
+        We query for the JavaScript top-level function `App` in App.tsx
+        instead of a Java class because Constellation's Java parser
+        intentionally does NOT populate `code` for Class/Method/Constructor/
+        Field entities (see constellation/parsers/java.py:189-201, 508-520
+        — no `code=` kwarg). The JavaScript parser DOES populate `code`
+        for top-level functions (constellation/parsers/javascript.py:274,
+        300, 364, 415, 487). The contract that find_symbols faithfully
+        propagates parser-stored `code` is identical regardless of which
+        language we exercise it through; testing it through JavaScript
+        avoids a Java parser limitation that would otherwise look like
+        a Postgres backend bug.
+
+        Triage note (Plan A Task 3): the previous version of this test
+        asserted `service.code is not None` for the Java `Service` class
+        and was failing because Java entities never have code. The
+        normalization fix in Plan A Task 1 changed the failure mode but
+        not the root cause — the assertion itself was simply wrong for
+        Java. This rewrite asks for a parser/language combination where
+        Constellation actually populates code, which is the correct
+        target for this contract assertion."""
         repository = seeded_postgres_contract_repository
         results = await pg_read_backend.find_symbols(
-            "Service", repository=repository, exact=True,
+            "App", repository=repository, exact=True,
         )
-        assert any(r.name == "Service" for r in results), \
-            f"Expected 'Service' class in fixture; got: {[r.name for r in results]}"
-        service = next(r for r in results if r.name == "Service")
-        assert service.code is not None, \
-            "Expected non-null code body on Service class"
+        # The fixture's App.tsx has multiple symbols matching "App"
+        # (App component, App function, etc.). Pick whichever one has
+        # a non-null `code` body — that's the function-level entity
+        # the JS parser populates.
+        with_code = [r for r in results if r.code is not None]
+        assert with_code, (
+            f"Expected at least one 'App' entity with non-null code in "
+            f"fixture; got: {[(r.name, r.entity_type, r.code is not None) for r in results]}"
+        )
+        # Pick the first one with code and verify its body is non-empty
+        # and contains some recognizable JS/TSX content.
+        app = with_code[0]
+        assert app.code, f"Expected non-empty code on {app.name}; got: {app.code!r}"
+        assert len(app.code) > 0

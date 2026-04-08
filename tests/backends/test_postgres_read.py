@@ -1221,3 +1221,66 @@ async def test_get_hook_usage_sets_truncated_when_limit_exceeded(backend, mock_p
 
     assert len(result) == 2
     assert all(n.truncated is True for n in result)
+
+
+@pytest.mark.asyncio
+async def test_connect_registers_jsonb_codec_alongside_pgvector(monkeypatch):
+    """PostgresReadBackend.connect must register a JSONB type codec on
+    every pool connection so asyncpg auto-decodes the `properties` JSONB
+    column into Python dicts instead of raw JSON strings. Without this,
+    _row_to_code_entity crashes with `dict(str)` on real Postgres data.
+
+    This test mocks asyncpg.create_pool to capture the init callback,
+    then invokes it with a mock connection and verifies both
+    register_vector (for pgvector) AND set_type_codec (for JSONB) are
+    called on that connection.
+    """
+    # Capture the init callback asyncpg.create_pool receives
+    captured_init = {}
+    mock_pool = MagicMock()
+
+    async def fake_create_pool(*args, **kwargs):
+        captured_init["fn"] = kwargs.get("init")
+        return mock_pool
+
+    monkeypatch.setattr("asyncpg.create_pool", fake_create_pool)
+
+    # Mock pgvector.register_vector so we can verify it was called
+    register_vector_mock = AsyncMock()
+    monkeypatch.setattr("pgvector.asyncpg.register_vector", register_vector_mock)
+
+    backend = PostgresReadBackend(
+        dsn="postgresql://test:test@localhost/test",
+        openai_api_key="sk-test-key",
+    )
+    await backend.connect()
+
+    # Verify create_pool was called with an init callback
+    init_fn = captured_init.get("fn")
+    assert init_fn is not None, "connect() must pass an init callback to create_pool"
+
+    # Simulate the pool calling the init with a fresh connection
+    mock_conn = AsyncMock()
+    await init_fn(mock_conn)
+
+    # Must register pgvector for the vector column
+    register_vector_mock.assert_called_once_with(mock_conn)
+
+    # Must register a jsonb codec for the properties column
+    mock_conn.set_type_codec.assert_called()
+    codec_calls = mock_conn.set_type_codec.call_args_list
+    jsonb_call = next(
+        (c for c in codec_calls if c.args[0] == "jsonb" or c.kwargs.get("typename") == "jsonb"),
+        None,
+    )
+    assert jsonb_call is not None, (
+        f"Expected set_type_codec to be called for 'jsonb'; got calls: {codec_calls}"
+    )
+    # Verify the codec uses json.loads for decoding (the whole point — asyncpg
+    # gives us a JSON string, we need a dict back)
+    import json
+    kwargs = jsonb_call.kwargs
+    assert kwargs.get("decoder") is json.loads, \
+        f"JSONB codec must decode via json.loads; got decoder={kwargs.get('decoder')}"
+    assert kwargs.get("schema") == "pg_catalog", \
+        f"JSONB codec should be scoped to pg_catalog.jsonb; got schema={kwargs.get('schema')}"

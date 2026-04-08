@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -39,10 +40,26 @@ class PostgresReadBackend(ReadBackend):
 
     async def connect(self) -> None:
         from pgvector.asyncpg import register_vector
-        # register_vector is called for every new connection in the pool
-        # so asyncpg knows how to encode/decode the vector type for search_code
+
+        async def _init_connection(conn: asyncpg.Connection) -> None:
+            # Register pgvector so asyncpg can encode/decode the vector
+            # column used by search_code.
+            await register_vector(conn)
+            # Register a JSONB codec so asyncpg auto-decodes the
+            # `properties` JSONB column into Python dicts. Without this
+            # asyncpg returns raw JSON strings and _row_to_code_entity
+            # crashes on `dict(str)`. Constellation's write path stores
+            # properties via auto-encoded dicts; the read path needs the
+            # symmetric decoder. Surfaced by Task 5's contract suite.
+            await conn.set_type_codec(
+                "jsonb",
+                encoder=json.dumps,
+                decoder=json.loads,
+                schema="pg_catalog",
+            )
+
         self._pool = await asyncpg.create_pool(
-            self._dsn, min_size=1, max_size=5, init=register_vector
+            self._dsn, min_size=1, max_size=5, init=_init_connection
         )
 
     async def close(self) -> None:

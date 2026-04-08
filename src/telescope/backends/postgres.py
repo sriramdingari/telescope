@@ -981,7 +981,10 @@ class PostgresReadBackend(ReadBackend):
             repository=file_sym.get("repository"),
             language=file_sym.get("language"),
             content_hash=file_sym.get("content_hash"),
-            packages=[r["symbol_name"] for r in package_rows],
+            packages=[
+                self._full_name_from_id(r["id"], r["symbol_name"])
+                for r in package_rows
+            ],
             exports=[
                 self._row_to_code_entity(dict(r))
                 for r in export_rows
@@ -1263,22 +1266,30 @@ class PostgresReadBackend(ReadBackend):
             """)
         total_exports = export_rows[0]["cnt"] if export_rows else 0
 
-        # Package names (only when include_packages=True to avoid an unnecessary query)
+        # Package names (only when include_packages=True to avoid an unnecessary query).
+        # Select id alongside symbol_name so we can reconstruct full dotted
+        # names for .NET nested namespaces via _full_name_from_id. Constellation's
+        # .NET parser stores the full path in id ("repo::Company.Product.Services")
+        # but only the leaf segment in symbol_name ("Services"). ORDER BY id sorts
+        # nested namespaces hierarchically instead of alphabetically by leaf.
         packages: list[str] = []
         if include_packages:
             if repository:
                 pkg_rows = await pool.fetch("""
-                    SELECT symbol_name FROM code_symbols
+                    SELECT id, symbol_name FROM code_symbols
                     WHERE symbol_type = 'Package' AND repository = $1
-                    ORDER BY symbol_name
+                    ORDER BY id
                 """, repository)
             else:
                 pkg_rows = await pool.fetch("""
-                    SELECT symbol_name FROM code_symbols
+                    SELECT id, symbol_name FROM code_symbols
                     WHERE symbol_type = 'Package'
-                    ORDER BY symbol_name
+                    ORDER BY id
                 """)
-            packages = [r["symbol_name"] for r in pkg_rows]
+            packages = [
+                self._full_name_from_id(r["id"], r["symbol_name"])
+                for r in pkg_rows
+            ]
 
         return CodebaseOverview(
             total_files=count_map.get("File", 0),

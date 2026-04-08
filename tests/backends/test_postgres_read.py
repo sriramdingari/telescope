@@ -672,6 +672,105 @@ async def test_get_file_context_packages_query_uses_shared_file_member(backend, 
 
 
 @pytest.mark.asyncio
+async def test_get_file_context_packages_reconstructs_nested_dotnet_namespace(
+    backend, mock_pool
+):
+    """file_context.packages must reconstruct full dotted names from the
+    entity id, not return the raw leaf-only symbol_name. Constellation's
+    .NET parser stores 'Services' in name and 'Company.Product.Services'
+    in id (dotnet.py:141). Returning the leaf produces confusing output
+    for users inspecting file context.
+
+    Mirrors Task 2's get_package_context fix — same _full_name_from_id
+    reconstruction pattern."""
+    file_row = {
+        "id": "repo::src/AuthService.cs",
+        "symbol_name": "AuthService.cs",
+        "file_path": "src/AuthService.cs",
+        "repository": "repo",
+        "language": "csharp",
+        "content_hash": "h",
+    }
+    # Shared-file members: a single Class
+    shared_file_members = [
+        {"symbol_name": "AuthService", "symbol_type": "Class"},
+    ]
+    top_level_methods: list = []
+    exports: list = []
+    # The packages query returns both id and symbol_name. The leaf is
+    # what the .NET parser stores; the id holds the full path.
+    package_rows = [
+        {"id": "repo::Company.Product.Services", "symbol_name": "Services"},
+    ]
+    hook_rows: list = []
+
+    call_count = {"n": 0}
+    fetch_sequence = [
+        [file_row],          # 1. resolver
+        shared_file_members, # 2. members
+        top_level_methods,   # 3. top-level methods
+        exports,             # 4. exports
+        package_rows,        # 5. packages
+        hook_rows,           # 6. hooks
+    ]
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_sequence[idx] if idx < len(fetch_sequence) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_file_context("AuthService.cs")
+
+    assert result is not None
+    assert result.packages == ["Company.Product.Services"], \
+        f"Expected full dotted namespace; got: {result.packages}"
+
+
+@pytest.mark.asyncio
+async def test_get_file_context_packages_java_full_name_is_idempotent(
+    backend, mock_pool
+):
+    """For Java packages, symbol_name IS the full dotted name, so
+    reconstruction via _full_name_from_id must be idempotent. This
+    guards against a fix that over-normalizes and breaks Java.
+    """
+    file_row = {
+        "id": "repo::src/Service.java",
+        "symbol_name": "Service.java",
+        "file_path": "src/Service.java",
+        "repository": "repo",
+        "language": "java",
+    }
+    shared_file_members = [
+        {"symbol_name": "Service", "symbol_type": "Class"},
+    ]
+    package_rows = [
+        # Java package: id has full name, symbol_name also has full name
+        {"id": "repo::com.example", "symbol_name": "com.example"},
+    ]
+    fetch_sequence = [
+        [file_row],
+        shared_file_members,
+        [],  # top_level_methods
+        [],  # exports
+        package_rows,
+        [],  # hooks
+    ]
+    call_count = {"n": 0}
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_sequence[idx] if idx < len(fetch_sequence) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_file_context("Service.java")
+
+    assert result is not None
+    assert result.packages == ["com.example"], \
+        f"Java full-name reconstruction must be idempotent; got: {result.packages}"
+
+
+@pytest.mark.asyncio
 async def test_get_codebase_overview_counts_exports(backend, mock_pool):
     """get_codebase_overview must include an exports count via the EXPORTS
     ref_type (matching Neo4j)."""
@@ -703,7 +802,10 @@ async def test_get_codebase_overview_include_packages_returns_names(backend, moc
     entry_points = []
     top_classes = []
     export_count = [{"cnt": 0}]
-    packages = [{"symbol_name": "com.example.app"}, {"symbol_name": "com.example.util"}]
+    packages = [
+        {"id": "repo::com.example.app", "symbol_name": "com.example.app"},
+        {"id": "repo::com.example.util", "symbol_name": "com.example.util"},
+    ]
 
     call_count = {"n": 0}
     fetch_sequence = [counts, langs, entry_points, top_classes, export_count, packages]
@@ -717,6 +819,56 @@ async def test_get_codebase_overview_include_packages_returns_names(backend, moc
 
     assert "com.example.app" in result.packages
     assert "com.example.util" in result.packages
+
+
+@pytest.mark.asyncio
+async def test_get_codebase_overview_reconstructs_nested_dotnet_namespaces(
+    backend, mock_pool
+):
+    """codebase_overview.packages must reconstruct full dotted names
+    from id, not return raw leaf-only symbol_name. Same _full_name_from_id
+    pattern as get_file_context.packages and get_package_context.
+
+    Mirrors the 6-entry fetch_sequence used by the existing test
+    `test_get_codebase_overview_include_packages_returns_names` at
+    test_postgres_read.py:495-516, plus the new `id` field in each
+    package row.
+    """
+    counts: list = []
+    langs: list = []
+    entry_points: list = []
+    top_classes: list = []
+    export_count = [{"cnt": 0}]
+    # .NET nested namespace scenario: parser stores the full path in id
+    # and the leaf segment in symbol_name. The fix must reconstruct the
+    # full dotted name via _full_name_from_id(id, symbol_name).
+    packages = [
+        {"id": "repo::Company", "symbol_name": "Company"},
+        {"id": "repo::Company.Product", "symbol_name": "Product"},
+        {"id": "repo::Company.Product.Services", "symbol_name": "Services"},
+    ]
+
+    call_count = {"n": 0}
+    fetch_sequence = [counts, langs, entry_points, top_classes, export_count, packages]
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_sequence[idx] if idx < len(fetch_sequence) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_codebase_overview(
+        repository="repo", include_packages=True
+    )
+
+    # Full dotted names, not leaves
+    assert "Company.Product.Services" in result.packages, \
+        f"Expected full dotted nested namespace; got: {result.packages}"
+    assert "Services" not in result.packages, \
+        f"Leaf-only 'Services' should not appear; got: {result.packages}"
+    # Top-level namespace is idempotent (id and name match)
+    assert "Company" in result.packages
+    # Middle-level namespace gets reconstructed too
+    assert "Company.Product" in result.packages
 
 
 @pytest.mark.asyncio
@@ -902,7 +1054,10 @@ async def test_get_codebase_overview_no_repository_with_include_packages(backend
     entry_points = []
     top_classes = []
     export_count = [{"cnt": 0}]
-    packages = [{"symbol_name": "repo1.pkg"}, {"symbol_name": "repo2.pkg"}]
+    packages = [
+        {"id": "repo1::repo1.pkg", "symbol_name": "repo1.pkg"},
+        {"id": "repo2::repo2.pkg", "symbol_name": "repo2.pkg"},
+    ]
 
     call_count = {"n": 0}
     fetch_sequence = [counts, langs, entry_points, top_classes, export_count, packages]

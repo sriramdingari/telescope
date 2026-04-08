@@ -201,7 +201,9 @@ class PostgresReadBackend(ReadBackend):
             properties=dict(row.get("properties") or {}),
         )
 
-    def _row_to_call_graph_node(self, row: dict, rel_type: str = "CALLS") -> CallGraphNode:
+    def _row_to_call_graph_node(
+        self, row: dict, rel_type: str = "CALLS", truncated: bool = False,
+    ) -> CallGraphNode:
         return CallGraphNode(
             name=row["symbol_name"],
             file_path=row["file_path"],
@@ -213,6 +215,7 @@ class PostgresReadBackend(ReadBackend):
             is_endpoint=bool(row.get("is_endpoint")),
             entity_type=str(row.get("symbol_type", "method")).lower(),
             relationship_type=rel_type,
+            truncated=truncated,
         )
 
     @staticmethod
@@ -444,6 +447,8 @@ class PostgresReadBackend(ReadBackend):
         # Expand to the full polymorphic method family
         family_ids = await self._resolve_method_family(symbol)
 
+        # Over-fetch by 1 so we can detect truncation without a separate
+        # count query. Mirrors neo4j.py:652.
         rows = await pool.fetch("""
             WITH RECURSIVE callers AS (
                 SELECT s.id, s.symbol_name, s.file_path, s.repository,
@@ -466,9 +471,15 @@ class PostgresReadBackend(ReadBackend):
             )
             SELECT DISTINCT ON (id) * FROM callers ORDER BY id, depth
             LIMIT $3
-        """, family_ids, depth, limit)
+        """, family_ids, depth, limit + 1)
 
-        return [self._row_to_call_graph_node(dict(r)) for r in rows]
+        truncated = len(rows) > limit
+        if truncated:
+            rows = rows[:limit]
+        return [
+            self._row_to_call_graph_node(dict(r), truncated=truncated)
+            for r in rows
+        ]
 
     async def get_callees(
         self, method_name: str, *,
@@ -488,6 +499,7 @@ class PostgresReadBackend(ReadBackend):
 
         family_ids = await self._resolve_method_family(symbol)
 
+        # Over-fetch calls by limit+1 so we can detect truncation.
         call_rows = await pool.fetch("""
             WITH RECURSIVE callees AS (
                 SELECT s.id, s.symbol_name, s.file_path, s.repository,
@@ -507,8 +519,10 @@ class PostgresReadBackend(ReadBackend):
             )
             SELECT DISTINCT ON (id) * FROM callees ORDER BY id, depth
             LIMIT $3
-        """, family_ids, depth, limit)
+        """, family_ids, depth, limit + 1)
 
+        # Over-fetch hooks by limit+1 too (previously unlimited, which
+        # meant a full-limit call set silently dropped every hook row).
         hook_rows = await pool.fetch("""
             SELECT s.id, s.symbol_name, s.file_path, s.repository,
                    s.signature, s.line_start, s.symbol_type,
@@ -516,11 +530,53 @@ class PostgresReadBackend(ReadBackend):
             FROM code_references r
             JOIN code_symbols s ON s.id = r.target_symbol_id
             WHERE r.source_symbol_id = ANY($1) AND r.ref_type = 'USES_HOOK'
-        """, family_ids)
+            LIMIT $2
+        """, family_ids, limit + 1)
 
-        results = [self._row_to_call_graph_node(dict(r)) for r in call_rows]
-        results += [self._row_to_call_graph_node(dict(r), rel_type="USES_HOOK") for r in hook_rows]
-        return results[:limit]
+        # Truncation is true if either source overflowed individually OR
+        # if the combined deduped list exceeds the limit. Matches Neo4j's
+        # holistic truncation detection (neo4j.py:742).
+        call_over = len(call_rows) > limit
+        hook_over = len(hook_rows) > limit
+
+        # Dedupe by id across the two sources. Calls come first in the
+        # merged order, matching Neo4j's ordering for the returned slice
+        # (Neo4j's formal sort on depth/file/line happens to coincide
+        # with calls-first because depth=1 ties are broken by file/line).
+        seen_ids: set[str] = set()
+        merged: list[CallGraphNode] = []
+
+        for r in call_rows:
+            if r["id"] in seen_ids:
+                continue
+            seen_ids.add(r["id"])
+            merged.append(
+                self._row_to_call_graph_node(dict(r), rel_type="CALLS", truncated=False)
+            )
+
+        for r in hook_rows:
+            if r["id"] in seen_ids:
+                continue
+            seen_ids.add(r["id"])
+            merged.append(
+                self._row_to_call_graph_node(dict(r), rel_type="USES_HOOK", truncated=False)
+            )
+
+        # Compute truncation AFTER merge+dedup so we know the true
+        # post-dedup count. Truncate to limit.
+        merged_over = len(merged) > limit
+        truncated = call_over or hook_over or merged_over
+        if len(merged) > limit:
+            merged = merged[:limit]
+
+        # Propagate truncated flag to every surviving node. We couldn't
+        # set it at construction time because we didn't know the final
+        # combined count yet.
+        if truncated:
+            for node in merged:
+                node.truncated = True
+
+        return merged
 
     # ── Full context ─────────────────────────────────────────────────────
 
@@ -794,7 +850,9 @@ class PostgresReadBackend(ReadBackend):
             params.append(stereotype)
             conditions.append(f"${len(params)} = ANY(s.stereotypes)")
 
-        params.append(limit)
+        # Over-fetch by 1 so we can detect truncation without a separate
+        # count query. Mirrors neo4j.py:1330.
+        params.append(limit + 1)
         rows = await pool.fetch(f"""
             SELECT s.id, s.symbol_name, s.file_path, s.repository,
                    s.signature, s.line_start, s.symbol_type,
@@ -806,7 +864,13 @@ class PostgresReadBackend(ReadBackend):
             LIMIT ${len(params)}
         """, *params)
 
-        return [self._row_to_call_graph_node(dict(r), rel_type="USES_HOOK") for r in rows]
+        truncated = len(rows) > limit
+        if truncated:
+            rows = rows[:limit]
+        return [
+            self._row_to_call_graph_node(dict(r), rel_type="USES_HOOK", truncated=truncated)
+            for r in rows
+        ]
 
     # ── Impact analysis ──────────────────────────────────────────────────
 

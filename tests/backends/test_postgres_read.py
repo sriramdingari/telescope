@@ -776,3 +776,172 @@ async def test_find_symbols_matches_file_path_in_fuzzy_mode(backend, mock_pool):
     )
     assert pattern.search(sql), \
         f"Expected '(symbol_name ILIKE $N OR file_path ILIKE $N)' grouped clause; got: {sql}"
+
+
+@pytest.mark.asyncio
+async def test_get_callers_sets_truncated_when_limit_exceeded(backend, mock_pool):
+    """get_callers must set truncated=True on every returned node when
+    more callers exist than the limit. Currently returns truncated=False
+    which gives users no signal."""
+    async def fake_resolve(*args, **kwargs):
+        return {"id": "repo::MyClass.doIt", "symbol_name": "doIt",
+                "file_path": "MyClass.java", "repository": "repo"}
+    backend._resolve_symbol = fake_resolve
+    backend._resolve_method_family = AsyncMock(return_value=["repo::MyClass.doIt"])
+
+    # Return limit + 1 rows (3 for limit=2)
+    mock_pool.fetch = AsyncMock(return_value=[
+        {"id": "c1", "symbol_name": "caller1", "file_path": "a.java",
+         "repository": "repo", "signature": None, "line_start": 1,
+         "symbol_type": "Method", "is_test": False, "is_endpoint": False,
+         "depth": 1},
+        {"id": "c2", "symbol_name": "caller2", "file_path": "b.java",
+         "repository": "repo", "signature": None, "line_start": 2,
+         "symbol_type": "Method", "is_test": False, "is_endpoint": False,
+         "depth": 1},
+        {"id": "c3", "symbol_name": "caller3", "file_path": "c.java",
+         "repository": "repo", "signature": None, "line_start": 3,
+         "symbol_type": "Method", "is_test": False, "is_endpoint": False,
+         "depth": 1},
+    ])
+
+    result = await backend.get_callers("doIt", limit=2)
+
+    # Only `limit` items returned (slicing)
+    assert len(result) == 2
+    # Every returned node signals truncation
+    assert all(node.truncated is True for node in result), \
+        f"Expected all nodes to have truncated=True; got: {[n.truncated for n in result]}"
+
+
+@pytest.mark.asyncio
+async def test_get_callers_does_not_set_truncated_when_under_limit(backend, mock_pool):
+    """When the result count is <= limit, truncated must be False."""
+    async def fake_resolve(*args, **kwargs):
+        return {"id": "repo::MyClass.doIt", "symbol_name": "doIt",
+                "file_path": "MyClass.java", "repository": "repo"}
+    backend._resolve_symbol = fake_resolve
+    backend._resolve_method_family = AsyncMock(return_value=["repo::MyClass.doIt"])
+
+    # Return 1 row (less than limit=50)
+    mock_pool.fetch = AsyncMock(return_value=[
+        {"id": "c1", "symbol_name": "caller1", "file_path": "a.java",
+         "repository": "repo", "signature": None, "line_start": 1,
+         "symbol_type": "Method", "is_test": False, "is_endpoint": False,
+         "depth": 1},
+    ])
+
+    result = await backend.get_callers("doIt", limit=50)
+
+    assert len(result) == 1
+    assert result[0].truncated is False
+
+
+@pytest.mark.asyncio
+async def test_get_callees_signals_truncation_when_combined_exceeds_limit(backend, mock_pool):
+    """Matches Neo4j semantics: calls come first in the merged list, then
+    hooks. When the combined count exceeds limit, the result is sliced to
+    limit and truncated=True. If calls alone fill the limit, hooks may be
+    dropped — but the caller gets truncated=True as the signal.
+
+    The old implementation fetched calls with LIMIT limit, hooks unlimited,
+    then sliced — producing silently wrong results with truncated=False.
+    The new implementation over-fetches both, dedupes, and sets truncated
+    correctly.
+    """
+    async def fake_resolve(*args, **kwargs):
+        return {"id": "repo::MyClass.doIt", "symbol_name": "doIt",
+                "file_path": "MyClass.java", "repository": "repo"}
+    backend._resolve_symbol = fake_resolve
+    backend._resolve_method_family = AsyncMock(return_value=["repo::MyClass.doIt"])
+
+    # 3 calls + 1 hook = 4 total, limit=3 → truncated
+    call_rows = [
+        {"id": f"call{i}", "symbol_name": f"callee_{i}", "file_path": "x.java",
+         "repository": "repo", "signature": None, "line_start": i,
+         "symbol_type": "Method", "is_test": False, "is_endpoint": False,
+         "depth": 1}
+        for i in range(3)
+    ]
+    hook_rows = [
+        {"id": "hook1", "symbol_name": "useAuth", "file_path": "x.java",
+         "repository": "repo", "signature": None, "line_start": 10,
+         "symbol_type": "Hook", "is_test": False, "is_endpoint": False,
+         "depth": 1},
+    ]
+
+    call_count = {"n": 0}
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return call_rows if idx == 0 else hook_rows
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_callees("doIt", limit=3)
+
+    # Total length is exactly limit
+    assert len(result) == 3
+    # Calls come first in the merged order, filling the limit
+    assert all(n.relationship_type == "CALLS" for n in result), \
+        "Calls should come before hooks in the merged result"
+    # Truncated is True because the combined count (4) > limit (3)
+    assert all(n.truncated is True for n in result), \
+        f"Expected truncated=True on all nodes; got: {[(n.name, n.truncated) for n in result]}"
+
+
+@pytest.mark.asyncio
+async def test_get_callees_limit_one_returns_single_call(backend, mock_pool):
+    """Edge case: limit=1 with one call and one hook returns exactly
+    the first call, with truncated=True signaling that more exist."""
+    async def fake_resolve(*args, **kwargs):
+        return {"id": "repo::MyClass.doIt", "symbol_name": "doIt",
+                "file_path": "MyClass.java", "repository": "repo"}
+    backend._resolve_symbol = fake_resolve
+    backend._resolve_method_family = AsyncMock(return_value=["repo::MyClass.doIt"])
+
+    call_rows = [
+        {"id": "call0", "symbol_name": "callee_0", "file_path": "x.java",
+         "repository": "repo", "signature": None, "line_start": 1,
+         "symbol_type": "Method", "is_test": False, "is_endpoint": False,
+         "depth": 1},
+    ]
+    hook_rows = [
+        {"id": "hook1", "symbol_name": "useAuth", "file_path": "x.java",
+         "repository": "repo", "signature": None, "line_start": 10,
+         "symbol_type": "Hook", "is_test": False, "is_endpoint": False,
+         "depth": 1},
+    ]
+
+    call_count = {"n": 0}
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return call_rows if idx == 0 else hook_rows
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_callees("doIt", limit=1)
+
+    assert len(result) == 1
+    # Matches Neo4j: calls come first; with limit=1 the call wins the slot
+    assert result[0].relationship_type == "CALLS"
+    assert result[0].name == "callee_0"
+    assert result[0].truncated is True
+
+
+@pytest.mark.asyncio
+async def test_get_hook_usage_sets_truncated_when_limit_exceeded(backend, mock_pool):
+    """get_hook_usage must signal truncation when more hook users exist
+    than the limit."""
+    # limit=2, return 3 rows
+    mock_pool.fetch = AsyncMock(return_value=[
+        {"id": f"u{i}", "symbol_name": f"user_{i}", "file_path": "x.tsx",
+         "repository": "repo", "signature": None, "line_start": i,
+         "symbol_type": "Method", "is_test": False, "is_endpoint": False,
+         "depth": 1}
+        for i in range(3)
+    ])
+
+    result = await backend.get_hook_usage("useAuth", limit=2)
+
+    assert len(result) == 2
+    assert all(n.truncated is True for n in result)

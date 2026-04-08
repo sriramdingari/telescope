@@ -242,6 +242,28 @@ class PostgresReadBackend(ReadBackend):
         return any(char.isupper() for char in stripped[1:])
 
     @staticmethod
+    def _apply_code_mode(entities: list["CodeEntity"], code_mode: str) -> None:
+        """Mutate entities to reflect the requested code_mode.
+
+        - "none": zero out the code field
+        - "signature": replace code with the method's signature
+        - "preview": keep only the first 10 lines of code
+        - anything else: leave code unchanged
+
+        Mirrors neo4j.py's code mode handling at lines 552, 598.
+        """
+        if code_mode == "none":
+            for e in entities:
+                e.code = None
+        elif code_mode == "signature":
+            for e in entities:
+                e.code = e.signature
+        elif code_mode == "preview":
+            for e in entities:
+                if e.code:
+                    e.code = "\n".join(e.code.splitlines()[:10])
+
+    @staticmethod
     def _normalize_repo_row(row: dict) -> dict:
         """Normalize Postgres row to match the API's expectations."""
         result = dict(row)
@@ -296,16 +318,7 @@ class PostgresReadBackend(ReadBackend):
         """, *params)
 
         entities = [self._row_to_code_entity(dict(r), score=r["score"]) for r in rows]
-        if code_mode == "none":
-            for e in entities:
-                e.code = None
-        elif code_mode == "signature":
-            for e in entities:
-                e.code = e.signature
-        elif code_mode == "preview":
-            for e in entities:
-                if e.code:
-                    e.code = "\n".join(e.code.splitlines()[:10])
+        self._apply_code_mode(entities, code_mode)
 
         # Blend in exact-symbol matches when the query looks like an identifier.
         # Mirrors neo4j.py:572 behavior: a user searching for "UserService"
@@ -334,6 +347,12 @@ class PostgresReadBackend(ReadBackend):
                     language=language,
                     stereotype=stereotype,
                 )
+            # Apply the same code_mode transformation to symbol results so
+            # the response contract is consistent across both result types.
+            # Without this, code_mode="none" would leak full source code
+            # for identifier queries.
+            self._apply_code_mode(symbol_results, code_mode)
+
             # Merge: exact (or fuzzy fallback) matches first, then vector hits, dedup by entity_id
             seen_ids = {e.entity_id for e in symbol_results}
             combined = list(symbol_results)

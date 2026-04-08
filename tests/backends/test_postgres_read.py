@@ -587,6 +587,162 @@ async def test_search_code_blends_exact_symbol_results(backend, mock_pool):
 
 
 @pytest.mark.asyncio
+async def test_search_code_applies_code_mode_to_blended_symbol_results(backend, mock_pool):
+    """code_mode=none must zero out the `code` field on BOTH vector hits
+    AND blended find_symbols results. A regression that only transforms
+    the vector path would leak full source code on identifier queries."""
+    backend._get_embedding = AsyncMock(return_value=[0.0] * 1536)
+
+    # Vector search returns 1 fuzzy method hit with full code
+    vector_rows = [
+        {
+            "id": "repo::Foo.getUser", "symbol_name": "getUser",
+            "symbol_type": "Method", "file_path": "Foo.java", "repository": "repo",
+            "line_start": 10, "line_end": 20,
+            "signature": "public User getUser()",
+            "code": "public User getUser() { return userRepo.find(); }",
+            "docstring": None, "language": "java", "return_type": "User",
+            "modifiers": [], "stereotypes": [], "content_hash": "h",
+            "properties": {}, "score": 0.85,
+        },
+    ]
+    # Symbol search returns 1 exact class hit with full code
+    symbol_rows = [
+        {
+            "id": "repo::UserService", "symbol_name": "UserService",
+            "symbol_type": "Class", "file_path": "UserService.java",
+            "repository": "repo", "line_start": 1, "line_end": 100,
+            "signature": "public class UserService",
+            "code": "public class UserService { /* 100 lines of code */ }",
+            "docstring": None, "language": "java", "return_type": None,
+            "modifiers": ["public"], "stereotypes": [],
+            "content_hash": "h", "properties": {},
+        },
+    ]
+
+    call_count = {"n": 0}
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return vector_rows if idx == 0 else symbol_rows
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    # The query "UserService" is identifier-like → blend path fires
+    result = await backend.search_code("UserService", code_mode="none")
+
+    # Both the vector hit AND the symbol hit must have code=None
+    assert len(result) == 2
+    for entity in result:
+        assert entity.code is None, \
+            f"code_mode='none' must zero out code on {entity.name}; got: {entity.code!r}"
+
+
+@pytest.mark.asyncio
+async def test_search_code_applies_signature_mode_to_blended_symbol_results(backend, mock_pool):
+    """code_mode=signature must replace `code` with `signature` on both
+    vector hits and blended symbol results."""
+    backend._get_embedding = AsyncMock(return_value=[0.0] * 1536)
+
+    vector_rows = [
+        {
+            "id": "repo::Foo.getUser", "symbol_name": "getUser",
+            "symbol_type": "Method", "file_path": "Foo.java", "repository": "repo",
+            "line_start": 10, "line_end": 20,
+            "signature": "public User getUser()",
+            "code": "public User getUser() { /* body */ }",
+            "docstring": None, "language": "java", "return_type": "User",
+            "modifiers": [], "stereotypes": [], "content_hash": "h",
+            "properties": {}, "score": 0.85,
+        },
+    ]
+    symbol_rows = [
+        {
+            "id": "repo::UserService", "symbol_name": "UserService",
+            "symbol_type": "Class", "file_path": "UserService.java",
+            "repository": "repo", "line_start": 1, "line_end": 100,
+            "signature": "public class UserService",
+            "code": "public class UserService { /* body */ }",
+            "docstring": None, "language": "java", "return_type": None,
+            "modifiers": ["public"], "stereotypes": [],
+            "content_hash": "h", "properties": {},
+        },
+    ]
+
+    call_count = {"n": 0}
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return vector_rows if idx == 0 else symbol_rows
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.search_code("UserService", code_mode="signature")
+
+    assert len(result) == 2
+    # Each entity's code must equal its signature (both transformed)
+    for entity in result:
+        assert entity.code == entity.signature, \
+            f"code_mode='signature' must set code=signature on {entity.name}; got code={entity.code!r}"
+
+
+@pytest.mark.asyncio
+async def test_search_code_applies_preview_mode_to_blended_symbol_results(backend, mock_pool):
+    """code_mode='preview' must slice code to the first 10 lines on BOTH
+    vector hits and blended symbol results. This covers the third branch
+    of _apply_code_mode (the other two are tested above)."""
+    backend._get_embedding = AsyncMock(return_value=[0.0] * 1536)
+
+    # Vector hit: 15-line method body
+    vector_code = "\n".join(f"line{i}" for i in range(15))
+    vector_rows = [
+        {
+            "id": "repo::Foo.getUser", "symbol_name": "getUser",
+            "symbol_type": "Method", "file_path": "Foo.java", "repository": "repo",
+            "line_start": 10, "line_end": 25,
+            "signature": "public User getUser()",
+            "code": vector_code,
+            "docstring": None, "language": "java", "return_type": "User",
+            "modifiers": [], "stereotypes": [], "content_hash": "h",
+            "properties": {}, "score": 0.85,
+        },
+    ]
+    # Symbol hit: 20-line class body
+    symbol_code = "\n".join(f"class_line{i}" for i in range(20))
+    symbol_rows = [
+        {
+            "id": "repo::UserService", "symbol_name": "UserService",
+            "symbol_type": "Class", "file_path": "UserService.java",
+            "repository": "repo", "line_start": 1, "line_end": 100,
+            "signature": "public class UserService",
+            "code": symbol_code,
+            "docstring": None, "language": "java", "return_type": None,
+            "modifiers": ["public"], "stereotypes": [],
+            "content_hash": "h", "properties": {},
+        },
+    ]
+
+    call_count = {"n": 0}
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return vector_rows if idx == 0 else symbol_rows
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.search_code("UserService", code_mode="preview")
+
+    assert len(result) == 2
+    # Each entity's code must be sliced to at most 10 lines
+    for entity in result:
+        assert entity.code is not None
+        lines = entity.code.splitlines()
+        assert len(lines) <= 10, \
+            f"code_mode='preview' must limit {entity.name} to 10 lines; got {len(lines)}"
+    # Spot-check that the slice took the FIRST 10 lines, not a random 10
+    by_name = {e.name: e for e in result}
+    assert by_name["getUser"].code == "\n".join(f"line{i}" for i in range(10))
+    assert by_name["UserService"].code == "\n".join(f"class_line{i}" for i in range(10))
+
+
+@pytest.mark.asyncio
 async def test_find_symbols_matches_file_path_in_fuzzy_mode(backend, mock_pool):
     """find_symbols fuzzy mode must match BOTH symbol_name AND file_path in an OR."""
     mock_pool.fetch = AsyncMock(return_value=[

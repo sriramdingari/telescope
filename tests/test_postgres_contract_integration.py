@@ -57,10 +57,11 @@ class TestPostgresContractHappyPaths:
         repo_context = await pg_read_backend.get_repository_context(repository)
         assert repo_context is not None
         assert repo_context.name == repository
-        # Same shape the Neo4j contract asserts: 2 files in the fixture repo
-        assert repo_context.total_files == 2
+        # Fixture repo has 3 files: Service.java, App.tsx, AuthService.cs
+        assert repo_context.total_files == 3
         assert "java" in repo_context.languages
         assert "javascript" in repo_context.languages
+        assert "csharp" in repo_context.languages
 
         package_context = await pg_read_backend.get_package_context(
             "com.example", repository=repository,
@@ -232,3 +233,57 @@ class TestPostgresContractTaskCoverage:
         app = with_code[0]
         assert app.code, f"Expected non-empty code on {app.name}; got: {app.code!r}"
         assert len(app.code) > 0
+
+    async def test_nested_dotnet_namespace_full_name_across_queries(
+        self, pg_read_backend, seeded_postgres_contract_repository,
+    ):
+        """End-to-end parity for nested .NET namespaces.
+
+        Constellation's .NET parser stores nested namespaces with the
+        full dotted path in the entity id but only the leaf segment in
+        symbol_name (dotnet.py:141). Telescope MUST reconstruct the full
+        dotted name consistently across every query that returns package
+        information:
+
+        1. get_package_context (fixed in Task 2, 2025-round)
+        2. get_file_context.packages (fixed in Plan C Task 1)
+        3. get_codebase_overview.packages (fixed in Plan C Task 2)
+
+        A regression in any of the three locations would surface here as
+        the leaf 'Services' leaking into a result that should show
+        'Company.Product.Services'. This test validates the end-to-end
+        Constellation → Postgres write → Telescope read path against a
+        single real nested-namespace fixture file (AuthService.cs).
+        Mirrors the Neo4j test at test_contract_integration.py.
+        """
+        repository = seeded_postgres_contract_repository
+
+        # (1) get_package_context by the full dotted name — the caller
+        # provides the full path; Postgres resolves via the id-suffix
+        # match + LIMIT 2 ambiguity check added in Task 2.
+        pkg_ctx = await pg_read_backend.get_package_context(
+            "Company.Product.Services", repository=repository,
+        )
+        assert pkg_ctx is not None, \
+            "Expected to resolve Company.Product.Services by full name"
+        assert pkg_ctx.name == "Company.Product.Services", \
+            f"get_package_context must return full dotted name; got: {pkg_ctx.name}"
+
+        # (2) get_file_context.packages must show the full name, not leaf
+        fc = await pg_read_backend.get_file_context(
+            "AuthService.cs", repository=repository,
+        )
+        assert fc is not None
+        assert "Company.Product.Services" in fc.packages, \
+            f"file_context.packages must show the full dotted name; got: {fc.packages}"
+        assert "Services" not in fc.packages, \
+            f"Leaf-only 'Services' must not appear in file_context.packages; got: {fc.packages}"
+
+        # (3) get_codebase_overview.packages must also show the full name
+        overview = await pg_read_backend.get_codebase_overview(
+            repository=repository, include_packages=True,
+        )
+        assert "Company.Product.Services" in overview.packages, \
+            f"codebase_overview.packages must show the full dotted name; got: {overview.packages}"
+        assert "Services" not in overview.packages, \
+            f"Leaf-only 'Services' must not appear in codebase_overview.packages; got: {overview.packages}"

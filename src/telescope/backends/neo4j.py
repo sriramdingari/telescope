@@ -1033,7 +1033,7 @@ class Neo4jReadBackend(ReadBackend):
                 WITH files, languages, classes, interfaces, methods, constructors, count(field) AS fields
                 OPTIONAL MATCH (pkg:Package) {repo_filter_pkg}
                 WITH files, languages, classes, interfaces, methods, constructors, fields,
-                     count(pkg) AS packages_count, collect(DISTINCT pkg.name) AS packages
+                     count(pkg) AS packages_count, collect(DISTINCT {{id: pkg.id, name: pkg.name}}) AS packages
                 OPTIONAL MATCH (hook:Hook) {repo_filter_hook}
                 WITH files, languages, classes, interfaces, methods, constructors, fields,
                      packages_count, packages, count(hook) AS hooks
@@ -1112,6 +1112,13 @@ class Neo4jReadBackend(ReadBackend):
 
         entry_points = [format_entry_point(entry) for entry in entry_results]
 
+        raw_packages = r.get("packages", []) or []
+        packages = [
+            self._full_name_from_id(pkg["id"], pkg["name"])
+            for pkg in raw_packages
+            if pkg and pkg.get("id")
+        ] if include_packages else []
+
         return CodebaseOverview(
             total_files=r.get("files", 0),
             total_classes=r.get("classes", 0),
@@ -1124,7 +1131,7 @@ class Neo4jReadBackend(ReadBackend):
             total_references=r.get("references", 0),
             total_exports=r.get("exports", 0),
             languages=[lang for lang in r.get("languages", []) if lang],
-            packages=[p for p in r.get("packages", []) if p] if include_packages else [],
+            packages=packages,
             top_level_classes=top_level_classes,
             entry_points=entry_points,
         )
@@ -1204,7 +1211,7 @@ class Neo4jReadBackend(ReadBackend):
             MATCH (f:File {repository: $repository, file_path: $file_path})
             OPTIONAL MATCH (member)-[:IN_PACKAGE]->(pkg:Package)
             WHERE member.repository = f.repository AND member.file_path = f.file_path
-            WITH f, collect(DISTINCT pkg.name) AS packages
+            WITH f, collect(DISTINCT {id: pkg.id, name: pkg.name}) AS packages
             OPTIONAL MATCH (cls:Class)
             WHERE cls.repository = f.repository AND cls.file_path = f.file_path
             WITH f, packages, collect(DISTINCT cls.name) AS classes
@@ -1278,13 +1285,19 @@ class Neo4jReadBackend(ReadBackend):
             for export in row.get("exports", [])
             if export.get("name")
         ]
+        raw_packages = row.get("packages", []) or []
+        packages = [
+            self._full_name_from_id(pkg["id"], pkg["name"])
+            for pkg in raw_packages
+            if pkg and pkg.get("id")
+        ]
         return FileContext(
             name=row["name"],
             file_path=row["file_path"] or "",
             repository=row.get("repository"),
             language=row.get("language"),
             content_hash=row.get("content_hash"),
-            packages=[pkg for pkg in row.get("packages", []) if pkg],
+            packages=packages,
             exports=exports,
             classes=[name for name in row.get("classes", []) if name],
             interfaces=[name for name in row.get("interfaces", []) if name],

@@ -1354,7 +1354,10 @@ class TestGetCodebaseOverview:
                 "references": 1,
                 "exports": 4,
                 "languages": ["Java"],
-                "packages": ["com.example", "com.util"],
+                "packages": [
+                    {"id": "repo::com.example", "name": "com.example"},
+                    {"id": "repo::com.util", "name": "com.util"},
+                ],
             }],
             [],  # top classes
             [],  # entry points
@@ -1366,6 +1369,49 @@ class TestGetCodebaseOverview:
         # Verify Cypher contains Package match
         overview_cypher = graph_client._query.call_args_list[0][0][0]
         assert "Package" in overview_cypher
+
+    async def test_get_codebase_overview_reconstructs_nested_dotnet_namespaces(self, graph_client):
+        """Neo4j parity: codebase_overview.packages must reconstruct full
+        dotted names from pkg.id, not return raw leaf-only pkg.name.
+        Same _full_name_from_id pattern as the get_file_context fix.
+
+        After the Cypher change, the main query's `packages` field is
+        a list of {id, name} dicts instead of a list of strings.
+        """
+        graph_client._query = AsyncMock(side_effect=[
+            # 1. Main overview query
+            [{
+                "files": 1,
+                "classes": 1,
+                "interfaces": 0,
+                "methods": 0,
+                "constructors": 0,
+                "fields": 0,
+                "packages_count": 3,
+                "hooks": 0,
+                "references": 1,
+                "exports": 0,
+                "languages": ["csharp"],
+                "packages": [
+                    {"id": "repo::Company", "name": "Company"},
+                    {"id": "repo::Company.Product", "name": "Product"},
+                    {"id": "repo::Company.Product.Services", "name": "Services"},
+                ],
+            }],
+            [],  # 2. top classes
+            [],  # 3. entry points
+        ])
+
+        result = await graph_client.get_codebase_overview(
+            repository="repo", include_packages=True,
+        )
+
+        assert "Company.Product.Services" in result.packages, \
+            f"Expected full dotted namespace; got: {result.packages}"
+        assert "Services" not in result.packages, \
+            f"Leaf-only 'Services' should not appear; got: {result.packages}"
+        assert "Company" in result.packages
+        assert "Company.Product" in result.packages
 
     async def test_get_codebase_overview_omits_packages_by_default(self, graph_client):
         """include_packages=False returns empty packages."""
@@ -1801,6 +1847,52 @@ class TestFindSymbols:
 class TestGetFileContext:
     """Tests for Neo4jReadBackend.get_file_context()."""
 
+    async def test_get_file_context_reconstructs_nested_dotnet_namespace(self, graph_client):
+        """Neo4j parity with the Postgres fix: get_file_context.packages
+        must reconstruct full dotted names from pkg.id, not return raw
+        pkg.name. Same _full_name_from_id pattern as get_package_context
+        (neo4j.py:976).
+
+        After the Cypher change, `packages` in the main query result is
+        a list of {id, name} dicts instead of a list of strings.
+        """
+        graph_client._query = AsyncMock(side_effect=[
+            # 1. _resolve_file_target → single file row
+            [{
+                "name": "AuthService.cs",
+                "file_path": "src/AuthService.cs",
+                "repository": "repo",
+                "language": "csharp",
+            }],
+            # 2. Main get_file_context query result
+            [{
+                "name": "AuthService.cs",
+                "file_path": "src/AuthService.cs",
+                "repository": "repo",
+                "language": "csharp",
+                "content_hash": "h",
+                # New shape: list of dicts with id + name, from the
+                # `collect(DISTINCT {id: pkg.id, name: pkg.name})` change.
+                "packages": [
+                    {"id": "repo::Company.Product.Services", "name": "Services"},
+                ],
+                "classes": ["AuthService"],
+                "interfaces": [],
+                "top_level_methods": [],
+                "constructors": [],
+                "fields": [],
+                "references": [],
+                "exports": [],
+                "hooks": [],
+            }],
+        ])
+
+        result = await graph_client.get_file_context("AuthService.cs", repository="repo")
+
+        assert result is not None
+        assert result.packages == ["Company.Product.Services"], \
+            f"Expected full dotted namespace; got: {result.packages}"
+
     async def test_get_file_context_returns_file_details(self, graph_client):
         graph_client._query = AsyncMock(side_effect=[
             [{
@@ -1816,7 +1908,7 @@ class TestGetFileContext:
                 "repository": "repo",
                 "language": "TypeScript",
                 "content_hash": "deadbeef",
-                "packages": ["src.components"],
+                "packages": [{"id": "repo::src.components", "name": "src.components"}],
                 "classes": ["App"],
                 "interfaces": ["Props"],
                 "top_level_methods": ["renderApp"],
@@ -1873,7 +1965,7 @@ class TestGetFileContext:
                 "repository": "repo",
                 "language": "Java",
                 "content_hash": "cafebabe",
-                "packages": ["com.example"],
+                "packages": [{"id": "repo::com.example", "name": "com.example"}],
                 "classes": ["Service"],
                 "interfaces": [],
                 "top_level_methods": [],

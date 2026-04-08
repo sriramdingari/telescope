@@ -78,6 +78,16 @@ class TestPostgresContractHappyPaths:
     async def test_file_context_returns_contained_class(
         self, pg_read_backend, seeded_postgres_contract_repository,
     ):
+        """Java file-context parity with Neo4j.
+
+        Mirrors the Neo4j contract at test_contract_integration.py:51-69
+        which asserts the full Service.java shape: package, class,
+        constructor, field, and unresolved call reference. Regressions
+        in Plan B Task 1's shared-file query rewrite should surface here
+        as missing constructors / fields / references. A regression in
+        Plan A's fixture normalization (stale absolute paths in storage)
+        would surface as either failed resolution or empty members.
+        """
         repository = seeded_postgres_contract_repository
         # Pass the relative-suffix the user would naturally type. Constellation
         # stores absolute paths (e.g. /abs/.../src/java/com/example/Service.java),
@@ -89,7 +99,15 @@ class TestPostgresContractHappyPaths:
             "Service.java", repository=repository,
         )
         assert fc is not None
-        assert "Service" in fc.classes
+        assert fc.name == "Service.java"
+        assert fc.packages == ["com.example"]
+        assert fc.classes == ["Service"]
+        assert fc.constructors == ["Service"], \
+            f"Expected Service constructor; got: {fc.constructors}"
+        assert fc.fields == ["client"], \
+            f"Expected client field; got: {fc.fields}"
+        assert fc.references == ["client.fetch"], \
+            f"Expected client.fetch reference; got: {fc.references}"
 
 
 class TestPostgresContractTaskCoverage:

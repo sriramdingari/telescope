@@ -543,6 +543,44 @@ async def test_get_file_context_returns_constructors_fields_references_via_share
 
 
 @pytest.mark.asyncio
+async def test_get_file_context_dedupes_overloaded_constructors(backend, mock_pool):
+    """For Java overloaded constructors, the FileContext.constructors list
+    must contain each name only once (matching Neo4j's collect(DISTINCT
+    cls.name) semantics). A regression that drops the Python-side dedup
+    would surface here as constructors == ['Service', 'Service']."""
+    file_row = {
+        "id": "repo::src/Service.java",
+        "symbol_name": "Service.java",
+        "file_path": "src/Service.java",
+        "repository": "repo",
+        "language": "java",
+    }
+    # Two overloaded constructors with the same name
+    shared_file_members = [
+        {"symbol_name": "Service", "symbol_type": "Class"},
+        {"symbol_name": "Service", "symbol_type": "Constructor"},
+        {"symbol_name": "Service", "symbol_type": "Constructor"},  # overload
+    ]
+
+    call_count = {"n": 0}
+    fetch_sequence = [
+        [file_row], shared_file_members, [], [], [], [],
+    ]
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_sequence[idx] if idx < len(fetch_sequence) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_file_context("Service.java")
+
+    assert result is not None
+    assert result.constructors == ["Service"], \
+        f"Expected dedup'd constructors == ['Service']; got: {result.constructors}"
+    assert result.classes == ["Service"]
+
+
+@pytest.mark.asyncio
 async def test_get_file_context_uses_shared_file_sql_for_members(backend, mock_pool):
     """Lock in the SQL shape: the members query must filter by
     `repository = $1 AND file_path = $2`, not by a File→CONTAINS edge
@@ -579,6 +617,15 @@ async def test_get_file_context_uses_shared_file_sql_for_members(backend, mock_p
         f"Expected shared-file match `file_path = $N`; got: {members_sql}"
     assert "ref_type = 'CONTAINS'" not in members_sql, \
         f"Members query should not filter by CONTAINS edge; got: {members_sql}"
+    # Lock in the exact shape: single-table scan on code_symbols filtered
+    # by (repository, file_path, symbol_type). A rewrite that drops the
+    # repository filter would silently cross-contaminate repos sharing
+    # the same file_path. A rewrite that joins through code_references
+    # with a different edge type would defeat the parser-agnostic goal.
+    assert "repository = $" in members_sql, \
+        f"Members query must filter by repository; got: {members_sql}"
+    assert "JOIN code_references" not in members_sql, \
+        f"Members query must be a single-table shared-file select; got: {members_sql}"
 
 
 @pytest.mark.asyncio
@@ -617,6 +664,11 @@ async def test_get_file_context_packages_query_uses_shared_file_member(backend, 
 
     assert "file_path = $" in package_sql, \
         f"Expected shared-file packages query; got: {package_sql}"
+    # Plan C requires pkg.id in the SELECT for full-name reconstruction
+    # via _full_name_from_id. Lock that in here so a future refactor
+    # that "tidies up unused columns" doesn't accidentally break Plan C.
+    assert "pkg.id" in package_sql, \
+        f"pkg.id must be in SELECT — Plan C reconstruction requires it; got: {package_sql}"
 
 
 @pytest.mark.asyncio

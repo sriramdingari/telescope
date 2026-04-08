@@ -987,13 +987,25 @@ class PostgresReadBackend(ReadBackend):
                 for r in export_rows
                 if r.get("symbol_name") and r.get("file_path")
             ],
-            classes=[r["symbol_name"] for r in members if r["symbol_type"] == "Class"],
-            interfaces=[r["symbol_name"] for r in members if r["symbol_type"] == "Interface"],
-            top_level_methods=[r["symbol_name"] for r in top_level_method_rows],
-            hooks=[r["symbol_name"] for r in hook_rows],
-            constructors=[r["symbol_name"] for r in members if r["symbol_type"] == "Constructor"],
-            fields=[r["symbol_name"] for r in members if r["symbol_type"] == "Field"],
-            references=[r["symbol_name"] for r in members if r["symbol_type"] == "Reference"],
+            classes=list(dict.fromkeys(
+                r["symbol_name"] for r in members if r["symbol_type"] == "Class"
+            )),
+            interfaces=list(dict.fromkeys(
+                r["symbol_name"] for r in members if r["symbol_type"] == "Interface"
+            )),
+            top_level_methods=list(dict.fromkeys(
+                r["symbol_name"] for r in top_level_method_rows
+            )),
+            hooks=list(dict.fromkeys(r["symbol_name"] for r in hook_rows)),
+            constructors=list(dict.fromkeys(
+                r["symbol_name"] for r in members if r["symbol_type"] == "Constructor"
+            )),
+            fields=list(dict.fromkeys(
+                r["symbol_name"] for r in members if r["symbol_type"] == "Field"
+            )),
+            references=list(dict.fromkeys(
+                r["symbol_name"] for r in members if r["symbol_type"] == "Reference"
+            )),
         )
 
     async def get_hook_usage(

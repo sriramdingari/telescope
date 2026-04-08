@@ -136,6 +136,8 @@ from pathlib import Path
 
 sys.path.insert(0, {str(_constellation_root())!r})
 
+from constellation.indexer.pipeline import IndexingPipeline
+from constellation.models import CodeEntity, EntityType
 from constellation.parsers.registry import get_default_registry
 
 root = Path({str(CONTRACT_FIXTURE_ROOT)!r})
@@ -149,9 +151,48 @@ for file_path in sorted(path for path in root.rglob('*') if path.is_file()):
     parser = registry.get_parser_for_file(file_path)
     if parser is None:
         continue
-    result = parser.parse_file(file_path, repository)
-    errors.extend(result.errors)
-    for entity in result.entities:
+    parse_result = parser.parse_file(file_path, repository)
+    errors.extend(parse_result.errors)
+
+    # Mirror IndexingPipeline lines 177-270: derive the canonical
+    # relative path and file_entity_id, run the production
+    # normalization step, then create the canonical File entity the
+    # pipeline would have created (the parser's File entity is
+    # dropped by _normalize_parse_result).
+    relative_path = str(file_path.relative_to(root))
+    file_entity_id = f"{{repository}}::{{relative_path}}"
+
+    # Static method — no pipeline instance needed. Returns
+    # (normalized_entities, normalized_relationships) with non-File
+    # entities having repo-relative file_paths, Python/JavaScript
+    # entity IDs remapped to the scoped-ID map, and CALLS target IDs
+    # resolved via call_aliases. See
+    # constellation/indexer/pipeline.py:325-380.
+    normalized_entities, normalized_relationships = (
+        IndexingPipeline._normalize_parse_result(
+            parse_result=parse_result,
+            relative_path=relative_path,
+            file_entity_id=file_entity_id,
+            language=parser.language,
+        )
+    )
+
+    # Canonical File entity, mirroring pipeline.py:252-262. We pass
+    # content_hash=None because the contract fixture doesn't need
+    # hash-based change detection (the contract tests exercise the
+    # graph shape, not incremental reindexing).
+    file_entity = CodeEntity(
+        id=file_entity_id,
+        name=file_path.name,
+        entity_type=EntityType.FILE,
+        repository=repository,
+        file_path=relative_path,
+        line_number=1,
+        language=parser.language,
+        content_hash=None,
+    )
+
+    for entity in [file_entity, *normalized_entities]:
         entities.append({{
             'id': entity.id,
             'name': entity.name,
@@ -170,7 +211,7 @@ for file_path in sorted(path for path in root.rglob('*') if path.is_file()):
             'properties': entity.properties,
             'content_hash': entity.content_hash,
         }})
-    for relationship in result.relationships:
+    for relationship in normalized_relationships:
         relationships.append({{
             'source_id': relationship.source_id,
             'target_id': relationship.target_id,

@@ -97,3 +97,31 @@ class TestConstellationContract:
             ("client.fetch", "reference"),
         ]
         assert any(symbol.entity_type == "method" for symbol in symbols)
+
+    async def test_seeded_fixture_uses_relative_file_paths(
+        self,
+        live_graph_client,
+        seeded_contract_repository,
+    ):
+        """Regression guard for contract-fixture normalization.
+
+        Mirrors test_seeded_postgres_fixture_uses_relative_file_paths in
+        the Postgres suite. Both fixtures should run Constellation's
+        production normalization step before seeding, so the contract
+        tests exercise the production graph shape instead of the raw
+        parser output.
+        """
+        repository = seeded_contract_repository
+
+        cypher = """
+            MATCH (n {repository: $repository})
+            WHERE n.file_path IS NOT NULL AND n.file_path STARTS WITH '/'
+            RETURN n.id AS id, n.file_path AS file_path, labels(n) AS labels
+            LIMIT 10
+        """
+        rows = await live_graph_client._query(cypher, repository=repository)
+
+        assert rows == [], (
+            f"Expected all file_paths to be relative (normalized), but found "
+            f"{len(rows)} rows with absolute paths. Examples: {rows}"
+        )

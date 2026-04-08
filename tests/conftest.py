@@ -452,7 +452,6 @@ def _seed_constellation_postgres_fixture(postgres_dsn: str, repository: str) -> 
     script = f"""
 import asyncio
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, {str(_constellation_root())!r})

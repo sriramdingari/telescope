@@ -1316,8 +1316,8 @@ async def test_get_file_context_resolves_absolute_path_by_suffix(backend, mock_p
         if idx == 0:
             # First call: resolver. Must use right()/length() or some
             # suffix-matching SQL, NOT exact equality.
-            assert "right(file_path" in sql or "RIGHT(file_path" in sql or "ENDS" in sql, \
-                f"Expected suffix-matching SQL in get_file_context resolver; got: {sql}"
+            assert "right(file_path, length($1)) = $1" in sql, \
+                f"Expected 'right(file_path, length($1)) = $1' suffix filter with correct bind; got: {sql}"
             # The first bind is the user-provided suffix
             suffix = args[0]
             # Simulate the filter behavior
@@ -1364,8 +1364,16 @@ async def test_get_file_context_raises_on_ambiguous_suffix(backend, mock_pool):
 
     mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
 
-    with pytest.raises(ValueError, match=r"[Aa]mbiguous"):
+    with pytest.raises(ValueError) as excinfo:
         await backend.get_file_context("util.py")
+
+    msg = str(excinfo.value)
+    assert "mbiguous" in msg, f"Expected 'ambiguous' in error; got: {msg}"
+    # The new error message lists the actual matching file paths, not just repositories
+    assert "/a/src/util.py" in msg, \
+        f"Expected matching file path in error message; got: {msg}"
+    assert "/b/src/util.py" in msg, \
+        f"Expected all matching file paths in error message; got: {msg}"
 
 
 @pytest.mark.asyncio

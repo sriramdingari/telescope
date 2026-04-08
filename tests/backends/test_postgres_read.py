@@ -381,10 +381,12 @@ async def test_get_codebase_overview_include_packages_returns_names(backend, moc
 async def test_get_package_context_populates_hooks_and_references(backend, mock_pool):
     """get_package_context must populate hooks and references as direct
     IN_PACKAGE members, not via a two-hop traversal. Matches Neo4j semantics."""
-    async def fake_resolve(*args, **kwargs):
-        return {"id": "repo::com.example", "symbol_name": "com.example",
+    async def fake_resolve_package(*args, **kwargs):
+        # symbol_name is the LEAF only — _full_name_from_id reconstructs
+        # the full dotted name "com.example" from the id.
+        return {"id": "repo::com.example", "symbol_name": "example",
                 "repository": "repo"}
-    backend._resolve_symbol = fake_resolve
+    backend._resolve_package = fake_resolve_package
 
     # members query returns ALL direct IN_PACKAGE members including hooks and refs
     members = [
@@ -408,10 +410,145 @@ async def test_get_package_context_populates_hooks_and_references(backend, mock_
     assert "useAuth" in result.hooks
     assert "Logger" in result.references
     assert "Foo" in result.classes
+    # Full dotted name reconstructed from id, not the leaf "example"
+    assert result.name == "com.example"
 
     # Verify only 2 fetch calls were made (members + child_pkgs)
     # No separate hooks or references queries — they come from the members row set
     assert mock_pool.fetch.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_package_context_resolves_nested_namespace_by_full_name(backend, mock_pool):
+    """A nested .NET namespace like 'Company.Product.Services' must be
+    resolvable by its full dotted name even though the parser stores only
+    'Services' as symbol_name."""
+    # _resolve_package queries the code_symbols table for packages whose
+    # id ends with "::Company.Product.Services"
+    resolved_row = {
+        "id": "repo::Company.Product.Services",
+        "symbol_name": "Services",  # leaf only — this is how .NET stores it
+        "repository": "repo",
+        "symbol_type": "Package",
+    }
+    members = [
+        {"symbol_name": "AuthService", "symbol_type": "Class", "file_path": "Services/AuthService.cs"},
+    ]
+    child_pkgs: list = []  # no children
+
+    call_count = {"n": 0}
+    fetch_sequence = [[resolved_row], members, child_pkgs]
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_sequence[idx] if idx < len(fetch_sequence) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_package_context("Company.Product.Services")
+
+    assert result is not None
+    # name should be the full dotted name (not the leaf)
+    assert result.name == "Company.Product.Services"
+    assert result.package_id == "repo::Company.Product.Services"
+    assert "AuthService" in result.classes
+
+    # Verify the resolver query uses ID-suffix matching, not symbol_name=
+    first_sql = mock_pool.fetch.call_args_list[0][0][0]
+    assert "id LIKE" in first_sql or "id ~" in first_sql or "ENDS" in first_sql, \
+        f"Expected id-suffix matching in resolver SQL; got: {first_sql}"
+
+
+@pytest.mark.asyncio
+async def test_get_package_context_enumerates_child_packages_via_id_prefix(backend, mock_pool):
+    """Child packages must be discovered via id prefix matching, not via
+    package-to-package CONTAINS edges (which .NET parser doesn't create)."""
+    resolved_row = {
+        "id": "repo::Company.Product",
+        "symbol_name": "Product",
+        "repository": "repo",
+        "symbol_type": "Package",
+    }
+    members: list = []
+    # Child packages: direct children only (Services and API, not Services.Auth)
+    child_pkgs = [
+        {"id": "repo::Company.Product.Services", "symbol_name": "Services"},
+        {"id": "repo::Company.Product.API", "symbol_name": "API"},
+    ]
+
+    call_count = {"n": 0}
+    fetch_sequence = [[resolved_row], members, child_pkgs]
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_sequence[idx] if idx < len(fetch_sequence) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_package_context("Company.Product")
+
+    assert result is not None
+    # Child packages reconstructed to their full dotted names
+    assert "Company.Product.Services" in result.child_packages
+    assert "Company.Product.API" in result.child_packages
+
+    # Verify child query uses id LIKE parent.id || '.%' pattern
+    third_sql = mock_pool.fetch.call_args_list[2][0][0]
+    assert "LIKE" in third_sql or "STARTS" in third_sql, \
+        f"Expected id-prefix matching for child packages; got: {third_sql}"
+
+
+@pytest.mark.asyncio
+async def test_get_package_context_returns_none_for_nonexistent_package(backend, mock_pool):
+    """A non-existent package must return None, not raise."""
+    mock_pool.fetch = AsyncMock(return_value=[])
+
+    result = await backend.get_package_context("NonExistent.Namespace")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_package_context_derives_files_from_member_file_paths(backend, mock_pool):
+    """PackageContext.files must contain the DISTINCT file_path of every
+    member with an IN_PACKAGE edge — NOT just members whose symbol_type is
+    File. Constellation's parsers attach IN_PACKAGE from classes, methods,
+    interfaces (etc.), never from file nodes, so the old 'symbol_type = File'
+    filter always returned empty. Neo4j derives files from any member's
+    file_path (neo4j.py:943), and the live Neo4j contract test explicitly
+    asserts Service.java is in package_context.files."""
+    resolved_row = {
+        "id": "repo::com.example",
+        "symbol_name": "example",
+        "repository": "repo",
+        "symbol_type": "Package",
+    }
+    # Members: 2 classes in Service.java + 1 class in Util.java + 1 method
+    # in Service.java. The result should be DISTINCT file paths.
+    members = [
+        {"symbol_name": "Service", "symbol_type": "Class", "file_path": "src/Service.java"},
+        {"symbol_name": "ServiceHelper", "symbol_type": "Class", "file_path": "src/Service.java"},
+        {"symbol_name": "Util", "symbol_type": "Class", "file_path": "src/Util.java"},
+        {"symbol_name": "doWork", "symbol_type": "Method", "file_path": "src/Service.java"},
+    ]
+    child_pkgs: list = []
+
+    call_count = {"n": 0}
+    fetch_sequence = [[resolved_row], members, child_pkgs]
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_sequence[idx] if idx < len(fetch_sequence) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_package_context("com.example")
+
+    assert result is not None
+    # Files must be DISTINCT file paths from ALL members, sorted for determinism
+    assert result.files == ["src/Service.java", "src/Util.java"], \
+        f"Expected distinct file paths from member classes/methods; got: {result.files}"
+    # Classes still come from the symbol_type filter
+    assert "Service" in result.classes
+    assert "ServiceHelper" in result.classes
+    assert "Util" in result.classes
 
 
 @pytest.mark.asyncio

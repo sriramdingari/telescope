@@ -106,6 +106,54 @@ class PostgresReadBackend(ReadBackend):
             )
         return dict(rows[0])
 
+    async def _resolve_package(
+        self,
+        name: str,
+        *,
+        repository: str | None = None,
+    ) -> dict | None:
+        """Resolve a package/namespace by its full dotted name via ID suffix matching.
+
+        Constellation's .NET parser stores nested namespaces with the full
+        path in the entity id (e.g., "repo::Company.Product.Services") but
+        only the leaf segment as symbol_name ("Services"). Matching on
+        symbol_name directly can't distinguish nested namespaces. Matching
+        on the ID suffix (id LIKE '%::Company.Product.Services') correctly
+        resolves the full name.
+
+        Mirrors Neo4j's resolver at neo4j.py:930.
+
+        Raises ValueError on ambiguity (multiple packages match the suffix).
+        """
+        pool = self._require_pool()
+        # Use id LIKE '%::name' to match the repository prefix + "::" + name.
+        # Escape LIKE metacharacters in the name to avoid false matches.
+        escaped_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        suffix_pattern = f"%::{escaped_name}"
+
+        conditions = [
+            "symbol_type = 'Package'",
+            "id LIKE $1 ESCAPE '\\'",
+        ]
+        params: list[Any] = [suffix_pattern]
+        if repository:
+            params.append(repository)
+            conditions.append(f"repository = ${len(params)}")
+
+        rows = await pool.fetch(
+            f"SELECT * FROM code_symbols WHERE {' AND '.join(conditions)} LIMIT 2",
+            *params,
+        )
+        if not rows:
+            return None
+        if len(rows) > 1:
+            ids = [r["id"] for r in rows]
+            raise ValueError(
+                f"Ambiguous package {name!r} — matches: {ids}. "
+                f"Provide repository= to disambiguate."
+            )
+        return dict(rows[0])
+
     async def _resolve_method_family(self, symbol: dict) -> list[str]:
         """Return the list of method IDs that form the polymorphic family
         of the given method: the method itself plus all sibling overrides
@@ -689,40 +737,60 @@ class PostgresReadBackend(ReadBackend):
         repository: str | None = None,
     ) -> PackageContext | None:
         pool = self._require_pool()
-        pkg = await self._resolve_symbol(
-            package_name, repository=repository, file_path=None,
-            entity_id=None, types=["Package"],
-        )
+        pkg = await self._resolve_package(package_name, repository=repository)
         if not pkg:
             return None
 
         # All direct IN_PACKAGE members (files, classes, interfaces, methods,
-        # hooks, references). The Neo4j backend uses the same direct-membership
-        # model at neo4j.py:942-954.
+        # hooks, references). Neo4j uses the same direct-membership model.
         members = await pool.fetch("""
             SELECT s.symbol_name, s.symbol_type, s.file_path
             FROM code_references r JOIN code_symbols s ON s.id = r.source_symbol_id
             WHERE r.target_symbol_id = $1 AND r.ref_type = 'IN_PACKAGE'
         """, pkg["id"])
 
-        child_pkgs = await pool.fetch("""
-            SELECT s.symbol_name FROM code_references r
-            JOIN code_symbols s ON s.id = r.source_symbol_id
-            WHERE r.target_symbol_id = $1 AND r.ref_type = 'CONTAINS'
-              AND s.symbol_type = 'Package'
-        """, pkg["id"])
+        # Child packages discovered via ID prefix matching, not via
+        # package-to-package CONTAINS edges (which .NET parser doesn't
+        # create). Only immediate children: the child's id must have
+        # EXACTLY ONE additional dotted segment beyond the parent's id.
+        parent_id = pkg["id"]
+        escaped_id = parent_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        child_prefix = f"{escaped_id}.%"
+        child_rows = await pool.fetch("""
+            SELECT id, symbol_name FROM code_symbols
+            WHERE symbol_type = 'Package'
+              AND id LIKE $1 ESCAPE '\\'
+              AND repository = $2
+        """, child_prefix, pkg["repository"])
+        # Filter to immediate children: full_name parts = parent parts + 1
+        parent_full = self._full_name_from_id(parent_id, pkg["symbol_name"])
+        parent_depth = len(parent_full.split("."))
+        immediate_children: list[str] = []
+        for r in child_rows:
+            child_full = self._full_name_from_id(r["id"], r["symbol_name"])
+            if len(child_full.split(".")) == parent_depth + 1:
+                immediate_children.append(child_full)
+
+        # Reconstruct the full dotted name from the ID for the returned name.
+        full_name = self._full_name_from_id(pkg["id"], pkg["symbol_name"])
 
         return PackageContext(
-            name=pkg["symbol_name"],
+            name=full_name,
             repository=pkg.get("repository"),
             package_id=pkg["id"],
-            files=[r["symbol_name"] for r in members if r["symbol_type"] == "File"],
+            # Files are ANY unique file_path across all members. This mirrors
+            # Neo4j's `collect(DISTINCT member.file_path)` at neo4j.py:943.
+            # The previous implementation filtered for symbol_type == "File"
+            # which always returned empty because Constellation's parsers
+            # attach IN_PACKAGE from classes/methods/interfaces, NOT from
+            # file nodes (see constellation/parsers/java.py:204).
+            files=sorted({r["file_path"] for r in members if r["file_path"]}),
             classes=[r["symbol_name"] for r in members if r["symbol_type"] == "Class"],
             interfaces=[r["symbol_name"] for r in members if r["symbol_type"] == "Interface"],
             methods=[r["symbol_name"] for r in members if r["symbol_type"] == "Method"],
             hooks=[r["symbol_name"] for r in members if r["symbol_type"] == "Hook"],
             references=[r["symbol_name"] for r in members if r["symbol_type"] == "Reference"],
-            child_packages=[r["symbol_name"] for r in child_pkgs],
+            child_packages=immediate_children,
         )
 
     async def get_file_context(

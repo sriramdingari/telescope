@@ -416,14 +416,16 @@ async def test_get_impact_excludes_family_methods_from_callers(backend, mock_poo
 
 @pytest.mark.asyncio
 async def test_get_file_context_populates_exports(backend, mock_pool):
-    """get_file_context must actually return exports, not hardcode [] ."""
-    # Mock pool.fetch to return different things for different queries in order:
-    # 1. Initial file lookup (LIMIT 2)
-    # 2. Contained entities
-    # 3. Exports (full entity rows)
-    # 4. Packages (via IN_PACKAGE)
-    # 5. Hook usages
-    # 6. References (USES_TYPE)
+    """get_file_context must actually return exports, not hardcode [].
+
+    Updated for the new 6-entry fetch order after Plan B Task 1's
+    shared-file query rewrite. The previous test version had a
+    references slot that encoded the broken USES_TYPE assumption;
+    that slot is dropped because the new query doesn't traverse
+    USES_TYPE for references. References parity is now covered by
+    test_get_file_context_returns_constructors_fields_references_via_shared_file
+    below.
+    """
     file_row = {
         "id": "repo::src/foo.py",
         "symbol_name": "foo.py",
@@ -432,10 +434,19 @@ async def test_get_file_context_populates_exports(backend, mock_pool):
         "language": "python",
         "content_hash": "h1",
     }
+    # New 6-entry fetch order:
+    # 1. resolver → file_row
+    # 2. shared-file members → empty (no class-scoped members in this test)
+    # 3. top-level methods (File→CONTAINS→Method) → empty (helper is
+    #    surfaced via EXPORTS in this test, not as a top-level method)
+    # 4. exports (File→EXPORTS→*) → the helper export row
+    # 5. packages (shared-file IN_PACKAGE) → com.example
+    # 6. hooks (shared-file Hook) → empty
     fetch_results = [
-        [file_row],  # initial file lookup
-        [{"symbol_name": "MyClass", "symbol_type": "Class", "line_start": 1}],  # contained
-        [{"id": "repo::src/foo.py::helper",  # exports (full entity rows)
+        [file_row],  # 1. file resolver
+        [],          # 2. shared-file members
+        [],          # 3. top-level methods
+        [{"id": "repo::src/foo.py::helper",  # 4. exports
           "symbol_name": "helper", "symbol_type": "Method",
           "file_path": "src/foo.py", "repository": "repo",
           "line_start": 5, "line_end": 10, "signature": "def helper()",
@@ -443,9 +454,8 @@ async def test_get_file_context_populates_exports(backend, mock_pool):
           "language": "python", "return_type": None,
           "modifiers": [], "stereotypes": [], "content_hash": "h1",
           "properties": {}}],
-        [{"symbol_name": "com.example"}],  # packages (IN_PACKAGE)
-        [],  # hook_usages
-        [{"symbol_name": "SomeType"}, {"symbol_name": "AnotherType"}],  # references
+        [{"id": "repo::com.example", "symbol_name": "com.example"}],  # 5. packages
+        [],          # 6. hooks
     ]
     call_count = {"n": 0}
     async def fetch_side_effect(*args, **kwargs):
@@ -462,10 +472,151 @@ async def test_get_file_context_populates_exports(backend, mock_pool):
     assert result.exports[0].name == "helper"
     # packages must include the package we returned — not []
     assert "com.example" in result.packages
-    # references must contain the Reference names we returned — not []
-    assert "SomeType" in result.references
-    assert "AnotherType" in result.references
-    assert len(result.references) == 2
+
+
+@pytest.mark.asyncio
+async def test_get_file_context_returns_constructors_fields_references_via_shared_file(
+    backend, mock_pool
+):
+    """Java/C# class-scoped members (constructors, fields, references) are
+    attached via HAS_METHOD/HAS_CONSTRUCTOR/HAS_FIELD edges from Class, NOT
+    File→CONTAINS. For Java unresolved calls, Reference entities are attached
+    via CALLS from Methods, NOT USES_TYPE. Both patterns are invisible to
+    an edge-traversal query rooted at File.
+
+    Neo4j sidesteps this by matching members on shared repository +
+    file_path regardless of edge type (neo4j.py:1216-1227). This test
+    asserts the Postgres implementation does the same: given a file row
+    and a set of shared-file member rows, the FileContext must surface
+    constructors, fields, and references even though no File→CONTAINS
+    edge exists for them.
+    """
+    file_row = {
+        "id": "repo::src/Service.java",
+        "symbol_name": "Service.java",
+        "file_path": "src/Service.java",
+        "repository": "repo",
+        "language": "java",
+        "content_hash": "h",
+    }
+    # Shared-file members — what the new query returns. Mix of entity
+    # types a real Java file would produce.
+    shared_file_members = [
+        {"symbol_name": "Service", "symbol_type": "Class"},
+        {"symbol_name": "Service", "symbol_type": "Constructor"},  # overload of class name
+        {"symbol_name": "client", "symbol_type": "Field"},
+        {"symbol_name": "client.fetch", "symbol_type": "Reference"},
+    ]
+    # Top-level methods (File→CONTAINS→Method) — empty for Java classes
+    top_level_methods: list = []
+    exports: list = []
+    package_rows = [
+        {"id": "repo::com.example", "symbol_name": "com.example"},
+    ]
+    hook_rows: list = []
+
+    call_count = {"n": 0}
+    fetch_sequence = [
+        [file_row],          # 1. file resolver
+        shared_file_members, # 2. shared-file members
+        top_level_methods,   # 3. top_level_methods
+        exports,             # 4. exports
+        package_rows,        # 5. packages
+        hook_rows,           # 6. hooks
+    ]
+    async def fetch_side_effect(*args, **kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_sequence[idx] if idx < len(fetch_sequence) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_file_context("Service.java")
+
+    assert result is not None
+    assert "Service" in result.classes
+    assert "Service" in result.constructors, \
+        f"Expected Service constructor from shared-file member; got: {result.constructors}"
+    assert "client" in result.fields, \
+        f"Expected client field from shared-file member; got: {result.fields}"
+    assert "client.fetch" in result.references, \
+        f"Expected client.fetch reference from shared-file member; got: {result.references}"
+
+
+@pytest.mark.asyncio
+async def test_get_file_context_uses_shared_file_sql_for_members(backend, mock_pool):
+    """Lock in the SQL shape: the members query must filter by
+    `repository = $1 AND file_path = $2`, not by a File→CONTAINS edge
+    traversal. A regression back to edge traversal would silently lose
+    Java constructors/fields/references.
+    """
+    file_row = {
+        "id": "repo::src/Service.java",
+        "symbol_name": "Service.java",
+        "file_path": "src/Service.java",
+        "repository": "repo",
+        "language": "java",
+    }
+
+    captured_sqls: list[str] = []
+    async def fetch_side_effect(sql, *args, **kwargs):
+        captured_sqls.append(sql)
+        if len(captured_sqls) == 1:
+            return [file_row]
+        return []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    await backend.get_file_context("Service.java")
+
+    members_sqls = [
+        sql for sql in captured_sqls
+        if "symbol_type IN" in sql and "Constructor" in sql and "Field" in sql
+    ]
+    assert members_sqls, \
+        f"Expected a members query with symbol_type IN (...Constructor, Field...); got SQLs: {captured_sqls}"
+    members_sql = members_sqls[0]
+
+    assert "file_path = $" in members_sql, \
+        f"Expected shared-file match `file_path = $N`; got: {members_sql}"
+    assert "ref_type = 'CONTAINS'" not in members_sql, \
+        f"Members query should not filter by CONTAINS edge; got: {members_sql}"
+
+
+@pytest.mark.asyncio
+async def test_get_file_context_packages_query_uses_shared_file_member(backend, mock_pool):
+    """The packages query must join through shared-file members, not through
+    File→CONTAINS→member, so that IN_PACKAGE edges from Field/Constructor/
+    Reference members (not just Classes) are also discovered. Mirrors Neo4j
+    at neo4j.py:1205-1207. A regression back to File→CONTAINS traversal
+    would silently drop package membership signaled through non-Class
+    members.
+    """
+    file_row = {
+        "id": "repo::src/Service.java",
+        "symbol_name": "Service.java",
+        "file_path": "src/Service.java",
+        "repository": "repo",
+        "language": "java",
+    }
+
+    captured_sqls: list[str] = []
+    async def fetch_side_effect(sql, *args, **kwargs):
+        captured_sqls.append(sql)
+        if len(captured_sqls) == 1:
+            return [file_row]
+        return []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    await backend.get_file_context("Service.java")
+
+    package_sqls = [
+        sql for sql in captured_sqls
+        if "IN_PACKAGE" in sql and "Package" in sql
+    ]
+    assert package_sqls, f"Expected a packages query; got SQLs: {captured_sqls}"
+    package_sql = package_sqls[0]
+
+    assert "file_path = $" in package_sql, \
+        f"Expected shared-file packages query; got: {package_sql}"
 
 
 @pytest.mark.asyncio

@@ -901,60 +901,79 @@ class PostgresReadBackend(ReadBackend):
                 f"{examples}. Provide repository= or a longer path suffix to disambiguate."
             )
         file_sym = dict(rows[0])
+        file_repo = file_sym["repository"]
+        file_fpath = file_sym["file_path"]
 
-        contained = await pool.fetch("""
-            SELECT s.symbol_name, s.symbol_type, s.line_start
-            FROM code_references r JOIN code_symbols s ON s.id = r.target_symbol_id
-            WHERE r.source_symbol_id = $1 AND r.ref_type = 'CONTAINS'
+        # ── Shared-file members ──────────────────────────────────────
+        # Classes, interfaces, constructors, fields, and references are
+        # attached to their enclosing class (HAS_METHOD, HAS_CONSTRUCTOR,
+        # HAS_FIELD) or to their enclosing method (CALLS→Reference), NOT
+        # to the file via CONTAINS. Match them by shared repository +
+        # file_path, regardless of edge type. Mirrors Neo4j's approach at
+        # neo4j.py:1208-1227.
+        members = await pool.fetch("""
+            SELECT symbol_name, symbol_type
+            FROM code_symbols
+            WHERE repository = $1
+              AND file_path = $2
+              AND symbol_type IN (
+                  'Class', 'Interface', 'Constructor', 'Field', 'Reference'
+              )
+        """, file_repo, file_fpath)
+
+        # ── Top-level methods via File→CONTAINS→Method ───────────────
+        # This is how JS/Python top-level functions are represented.
+        # Java class methods do NOT appear here because the Java parser
+        # attaches them via HAS_METHOD from Class, not CONTAINS from File.
+        # Neo4j uses the same edge query at neo4j.py:1214.
+        top_level_method_rows = await pool.fetch("""
+            SELECT s.symbol_name
+            FROM code_references r
+            JOIN code_symbols s ON s.id = r.target_symbol_id
+            WHERE r.source_symbol_id = $1
+              AND r.ref_type = 'CONTAINS'
+              AND s.symbol_type = 'Method'
         """, file_sym["id"])
 
-        # Exports: return full CodeEntity objects (not just names), matching Neo4j contract
+        # ── Exports (File→EXPORTS→*) ─────────────────────────────────
+        # Unchanged from previous implementation — File→EXPORTS→* is the
+        # correct pattern and matches Neo4j at neo4j.py:1228.
         export_rows = await pool.fetch("""
             SELECT s.*
-            FROM code_references r JOIN code_symbols s ON s.id = r.target_symbol_id
+            FROM code_references r
+            JOIN code_symbols s ON s.id = r.target_symbol_id
             WHERE r.source_symbol_id = $1 AND r.ref_type = 'EXPORTS'
         """, file_sym["id"])
 
-        # Packages that this file belongs to (via IN_PACKAGE from file's contained symbols)
-        # A file belongs to any package its contained classes/methods are IN_PACKAGE of.
+        # ── Packages via shared-file member IN_PACKAGE ───────────────
+        # Any IN_PACKAGE edge from a member in this file. Mirrors Neo4j
+        # at neo4j.py:1205-1207. Note: this still returns the leaf-only
+        # `symbol_name` for nested .NET namespaces — Plan C
+        # (2026-04-08-telescope-nested-namespace-reconstruction.md)
+        # will reconstruct full dotted names via _full_name_from_id.
         package_rows = await pool.fetch("""
-            SELECT DISTINCT pkg.symbol_name
-            FROM code_references r1
-            JOIN code_symbols contained ON contained.id = r1.target_symbol_id
-            JOIN code_references r2 ON r2.source_symbol_id = contained.id
-            JOIN code_symbols pkg ON pkg.id = r2.target_symbol_id
-            WHERE r1.source_symbol_id = $1
-              AND r1.ref_type = 'CONTAINS'
-              AND r2.ref_type = 'IN_PACKAGE'
+            SELECT DISTINCT pkg.id, pkg.symbol_name
+            FROM code_symbols member
+            JOIN code_references r ON r.source_symbol_id = member.id
+            JOIN code_symbols pkg ON pkg.id = r.target_symbol_id
+            WHERE member.repository = $1
+              AND member.file_path = $2
+              AND r.ref_type = 'IN_PACKAGE'
               AND pkg.symbol_type = 'Package'
-        """, file_sym["id"])
+        """, file_repo, file_fpath)
 
-        # USES_HOOK relationships are on Method/Constructor nodes, not File nodes.
-        # Traverse: File --CONTAINS--> Method/Constructor --USES_HOOK--> Hook
-        hook_usages = await pool.fetch("""
-            SELECT DISTINCT h.symbol_name
-            FROM code_references r1
-            JOIN code_symbols method ON method.id = r1.target_symbol_id
-            JOIN code_references r2 ON r2.source_symbol_id = method.id
-            JOIN code_symbols h ON h.id = r2.target_symbol_id
-            WHERE r1.source_symbol_id = $1
-              AND r1.ref_type = 'CONTAINS'
-              AND method.symbol_type IN ('Method', 'Constructor')
-              AND r2.ref_type = 'USES_HOOK'
-        """, file_sym["id"])
-
-        # References (Reference-type symbols used within the file, via USES_TYPE from contained members)
-        reference_rows = await pool.fetch("""
-            SELECT DISTINCT ref.symbol_name
-            FROM code_references r1
-            JOIN code_symbols contained ON contained.id = r1.target_symbol_id
-            JOIN code_references r2 ON r2.source_symbol_id = contained.id
-            JOIN code_symbols ref ON ref.id = r2.target_symbol_id
-            WHERE r1.source_symbol_id = $1
-              AND r1.ref_type = 'CONTAINS'
-              AND r2.ref_type = 'USES_TYPE'
-              AND ref.symbol_type = 'Reference'
-        """, file_sym["id"])
+        # ── Hooks via shared-file match ──────────────────────────────
+        # Hook entities live in whichever file their usage site is. Match
+        # by shared repository + file_path. Mirrors Neo4j at
+        # neo4j.py:1243-1244. Replaces the previous two-hop File→CONTAINS
+        # →Method→USES_HOOK→Hook traversal.
+        hook_rows = await pool.fetch("""
+            SELECT symbol_name
+            FROM code_symbols
+            WHERE repository = $1
+              AND file_path = $2
+              AND symbol_type = 'Hook'
+        """, file_repo, file_fpath)
 
         return FileContext(
             name=file_sym["symbol_name"],
@@ -968,13 +987,13 @@ class PostgresReadBackend(ReadBackend):
                 for r in export_rows
                 if r.get("symbol_name") and r.get("file_path")
             ],
-            classes=[r["symbol_name"] for r in contained if r["symbol_type"] == "Class"],
-            interfaces=[r["symbol_name"] for r in contained if r["symbol_type"] == "Interface"],
-            top_level_methods=[r["symbol_name"] for r in contained if r["symbol_type"] == "Method"],
-            hooks=[r["symbol_name"] for r in hook_usages],
-            constructors=[r["symbol_name"] for r in contained if r["symbol_type"] == "Constructor"],
-            fields=[r["symbol_name"] for r in contained if r["symbol_type"] == "Field"],
-            references=[r["symbol_name"] for r in reference_rows],
+            classes=[r["symbol_name"] for r in members if r["symbol_type"] == "Class"],
+            interfaces=[r["symbol_name"] for r in members if r["symbol_type"] == "Interface"],
+            top_level_methods=[r["symbol_name"] for r in top_level_method_rows],
+            hooks=[r["symbol_name"] for r in hook_rows],
+            constructors=[r["symbol_name"] for r in members if r["symbol_type"] == "Constructor"],
+            fields=[r["symbol_name"] for r in members if r["symbol_type"] == "Field"],
+            references=[r["symbol_name"] for r in members if r["symbol_type"] == "Reference"],
         )
 
     async def get_hook_usage(

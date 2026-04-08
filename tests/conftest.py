@@ -431,6 +431,24 @@ def _seed_constellation_postgres_fixture(postgres_dsn: str, repository: str) -> 
     and relationships are written via apply_indexing_changes(), which
     is the exact code path production indexing uses.
     """
+    # Graceful skip if Constellation venv or root isn't available.
+    # Matches the plan's "skips gracefully when either Docker or Constellation
+    # is missing" contract. The check is at fixture-use time rather than
+    # module import so contributors without Constellation can still run the
+    # non-integration suite; only the postgres_integration tests skip.
+    constellation_python = _constellation_python()
+    if not constellation_python.exists():
+        pytest.skip(
+            f"Constellation Python interpreter not found at {constellation_python}. "
+            f"Set CONSTELLATION_ROOT or CONSTELLATION_PYTHON to run postgres contract tests."
+        )
+    constellation_root = _constellation_root()
+    if not (constellation_root / "constellation" / "graph" / "postgres.py").exists():
+        pytest.skip(
+            f"Constellation source not found at {constellation_root}. "
+            f"Set CONSTELLATION_ROOT to the path containing constellation/graph/postgres.py."
+        )
+
     script = f"""
 import asyncio
 import sys
@@ -497,31 +515,20 @@ async def main() -> None:
 
 asyncio.run(main())
 """
-    subprocess.run(
-        [str(_constellation_python()), "-c", script],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-
-async def _delete_repository_postgres(postgres_dsn: str, repository: str) -> None:
-    """Remove a repository's rows from Postgres. Runs in Telescope's own
-    Python because it only needs asyncpg (already a Telescope dep).
-
-    Idempotent — safe to call even if the repository doesn't exist.
-    """
-    import asyncpg
-    conn = await asyncpg.connect(postgres_dsn)
     try:
-        await conn.execute(
-            "DELETE FROM code_symbols WHERE repository = $1", repository
+        subprocess.run(
+            [str(_constellation_python()), "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
         )
-        await conn.execute(
-            "DELETE FROM code_repos WHERE name = $1", repository
-        )
-    finally:
-        await conn.close()
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"Constellation seeding subprocess failed "
+            f"(exit code {exc.returncode}).\n"
+            f"stdout:\n{exc.stdout}\n"
+            f"stderr:\n{exc.stderr}"
+        ) from exc
 
 
 @pytest_asyncio.fixture
@@ -529,19 +536,20 @@ async def seeded_postgres_contract_repository(postgres_dsn):
     """Seed the session-scoped pgvector container with the contract fixture
     repo (parsed by Constellation's real parsers and loaded via
     Constellation's real PostgresWriteBackend). Yields a unique repository
-    name and cleans up afterward.
+    name.
+
+    Per-test cleanup is intentionally omitted: each test gets a
+    uuid4-suffixed repository name, queries always filter by
+    `repository = $1`, and the container is torn down at session end.
+    Adding Telescope-side cleanup would require duplicating Constellation's
+    schema knowledge (which tables to delete from), creating a drift risk
+    if Constellation ever adds new tables that don't cascade from
+    code_symbols. Session-end teardown is the schema-ownership-safe
+    alternative.
 
     Mirrors the Neo4j contract pattern at conftest.py:228 but uses
     Constellation's Postgres write path instead of raw Cypher.
     """
-    import uuid
-    repository = f"telescope-postgres-contract-{uuid.uuid4().hex[:8]}"
+    repository = f"telescope-postgres-contract-{uuid4().hex[:8]}"
     _seed_constellation_postgres_fixture(postgres_dsn, repository)
-    try:
-        yield repository
-    finally:
-        # Best-effort cleanup; test failures are the real signal
-        try:
-            await _delete_repository_postgres(postgres_dsn, repository)
-        except Exception:
-            pass
+    yield repository

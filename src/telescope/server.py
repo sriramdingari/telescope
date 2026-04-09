@@ -373,7 +373,8 @@ async def get_function_context(
     )
 
     if not result:
-        raise ValueError(f"Method '{method_name}' not found in graph")
+        identifier = method_name or entity_id
+        raise ValueError(f"Method '{identifier}' not found in graph")
 
     return {
         "name": result.name,
@@ -747,7 +748,8 @@ async def get_impact(
     )
 
     if not result:
-        raise ValueError(f"Method '{method_name}' not found in graph")
+        identifier = method_name or entity_id
+        raise ValueError(f"Method '{identifier}' not found in graph")
 
     return {
         "target_name": result.target_name,

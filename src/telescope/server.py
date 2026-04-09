@@ -246,6 +246,7 @@ async def get_callers(
     ctx: Context[ServerSession, AppContext],
     repository: str | None = None,
     file_path: str | None = None,
+    entity_id: str | None = None,
     depth: int = 1,
     limit: int = 50,
 ) -> list[dict]:
@@ -255,9 +256,11 @@ async def get_callers(
     Use this to understand the impact of changing a function - who depends on it?
 
     Args:
-        method_name: Name of the method to find callers for
+        method_name: Name of the method to find callers for (ignored if entity_id is set)
         repository: Filter by repository name (e.g., "consumer-operations")
         file_path: Disambiguate if multiple methods have the same name
+        entity_id: Exact graph entity id from a prior tool result (bypasses name-based
+                   ambiguity resolution; preferred for chained traversal)
         depth: How many levels up to traverse (default 1, max 3)
         limit: Maximum callers to return (default 50, max 200)
 
@@ -271,6 +274,7 @@ async def get_callers(
         method_name=method_name,
         file_path=file_path,
         repository=repository,
+        entity_id=entity_id,
         depth=min(depth, 3),
         limit=min(limit, 200),
     )
@@ -284,6 +288,7 @@ async def get_callees(
     ctx: Context[ServerSession, AppContext],
     repository: str | None = None,
     file_path: str | None = None,
+    entity_id: str | None = None,
     depth: int = 1,
     limit: int = 50,
 ) -> list[dict]:
@@ -293,9 +298,11 @@ async def get_callees(
     Use this to understand what a method depends on before modifying it.
 
     Args:
-        method_name: Name of the method to analyze
+        method_name: Name of the method to analyze (ignored if entity_id is set)
         repository: Filter by repository name (e.g., "consumer-operations")
         file_path: Disambiguate if multiple methods have the same name
+        entity_id: Exact graph entity id from a prior tool result (bypasses name-based
+                   ambiguity resolution; preferred for chained traversal)
         depth: How many levels down to traverse (default 1, max 3)
         limit: Maximum graph targets to return (default 50, max 200)
 
@@ -309,6 +316,7 @@ async def get_callees(
         method_name=method_name,
         file_path=file_path,
         repository=repository,
+        entity_id=entity_id,
         depth=min(depth, 3),
         limit=min(limit, 200),
     )
@@ -322,6 +330,7 @@ async def get_function_context(
     ctx: Context[ServerSession, AppContext],
     repository: str | None = None,
     file_path: str | None = None,
+    entity_id: str | None = None,
 ) -> dict:
     """
     Get comprehensive context for a function before modifying it.
@@ -330,9 +339,11 @@ async def get_function_context(
     This is the go-to tool before making changes to understand full impact.
 
     Args:
-        method_name: Name of the method
+        method_name: Name of the method (ignored if entity_id is set)
         repository: Filter by repository name (e.g., "consumer-operations")
         file_path: Disambiguate if multiple methods have the same name
+        entity_id: Exact graph entity id from a prior tool result (bypasses name-based
+                   ambiguity resolution; preferred for chained traversal)
 
     Returns:
         Full context including code and relationships
@@ -343,6 +354,7 @@ async def get_function_context(
         method_name=method_name,
         file_path=file_path,
         repository=repository,
+        entity_id=entity_id,
     )
 
     if not result:
@@ -666,6 +678,7 @@ async def get_impact(
     ctx: Context[ServerSession, AppContext],
     repository: str | None = None,
     file_path: str | None = None,
+    entity_id: str | None = None,
     depth: int = 10,
     summary_only: bool = False,
     limit: int | None = None,
@@ -679,9 +692,11 @@ async def get_impact(
     Use this BEFORE making changes to understand full impact.
 
     Args:
-        method_name: Name of the method to analyze
+        method_name: Name of the method to analyze (ignored if entity_id is set)
         repository: Filter by repository name
         file_path: Disambiguate if multiple methods have same name
+        entity_id: Exact graph entity id from a prior tool result (bypasses name-based
+                   ambiguity resolution; preferred for chained traversal)
         depth: Max call chain depth (default 10, use higher for deeper analysis)
         summary_only: If True, return only counts without caller details (fast overview)
         limit: Max callers per category (tests, endpoints, others). Use for large methods.
@@ -705,6 +720,7 @@ async def get_impact(
         method_name=method_name,
         file_path=file_path,
         repository=repository,
+        entity_id=entity_id,
         depth=depth,
         summary_only=summary_only,
         limit=limit,

@@ -358,6 +358,7 @@ class Neo4jReadBackend(ReadBackend):
         method_name: str,
         repository: str | None = None,
         file_path: str | None = None,
+        entity_id: str | None = None,
     ) -> dict | None:
         """Resolve one method/constructor for exact-context queries."""
         match_clause, params = self._build_method_match(
@@ -365,6 +366,7 @@ class Neo4jReadBackend(ReadBackend):
             method_name=method_name,
             repository=repository,
             file_path=file_path,
+            entity_id=entity_id,
         )
         cypher = f"""
             {match_clause}
@@ -796,12 +798,14 @@ class Neo4jReadBackend(ReadBackend):
         *,
         repository: str | None = None,
         file_path: str | None = None,
+        entity_id: str | None = None,
     ) -> FunctionContext | None:
         """Get full context for a function: code, callers, callees, class."""
         target = await self._resolve_method_target(
             method_name,
             repository=repository,
             file_path=file_path,
+            entity_id=entity_id,
         )
         if not target:
             return None
@@ -1402,6 +1406,7 @@ class Neo4jReadBackend(ReadBackend):
         *,
         repository: str | None = None,
         file_path: str | None = None,
+        entity_id: str | None = None,
         depth: int = 10,
         summary_only: bool = False,
         limit: int | None = None,
@@ -1411,6 +1416,7 @@ class Neo4jReadBackend(ReadBackend):
             method_name,
             repository=repository,
             file_path=file_path,
+            entity_id=entity_id,
         )
         if not target:
             return None

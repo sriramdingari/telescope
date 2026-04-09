@@ -1236,6 +1236,49 @@ async def test_get_function_context_populates_full_name_and_class_name(backend, 
 
 
 @pytest.mark.asyncio
+async def test_get_function_context_accepts_entity_id(backend, mock_pool):
+    """get_function_context must accept entity_id and thread it through
+    to _resolve_symbol, bypassing name-based ambiguity resolution so
+    agents can chain from a prior tool result's entity_id field."""
+    captured: dict = {}
+
+    async def capture_resolve(*args, **kwargs):
+        captured.update(kwargs)
+        return None  # short-circuit; get_function_context returns None
+
+    backend._resolve_symbol = capture_resolve
+
+    await backend.get_function_context(
+        "ignored", entity_id="repo::Target.method"
+    )
+
+    assert captured.get("entity_id") == "repo::Target.method", (
+        f"get_function_context must pass entity_id to _resolve_symbol; "
+        f"got: {captured}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_impact_accepts_entity_id(backend, mock_pool):
+    """get_impact must accept entity_id and thread it through to
+    _resolve_symbol, bypassing name-based ambiguity resolution so
+    agents can chain from a prior tool result's entity_id field."""
+    captured: dict = {}
+
+    async def capture_resolve(*args, **kwargs):
+        captured.update(kwargs)
+        return None  # short-circuit; get_impact returns None
+
+    backend._resolve_symbol = capture_resolve
+
+    await backend.get_impact("ignored", entity_id="repo::Target.method")
+
+    assert captured.get("entity_id") == "repo::Target.method", (
+        f"get_impact must pass entity_id to _resolve_symbol; got: {captured}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_get_function_context_handles_missing_owning_class(backend, mock_pool):
     """A top-level function (no owning class) should get class_name=None."""
     async def fake_resolve(*args, **kwargs):

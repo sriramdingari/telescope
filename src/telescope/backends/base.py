@@ -80,6 +80,7 @@ class ReadBackend(ABC):
         self, method_name: str, *,
         repository: str | None = None,
         file_path: str | None = None,
+        entity_id: str | None = None,
     ) -> FunctionContext | None: ...
 
     @abstractmethod
@@ -116,6 +117,7 @@ class ReadBackend(ABC):
         self, method_name: str, *,
         repository: str | None = None,
         file_path: str | None = None,
+        entity_id: str | None = None,
         depth: int = 10,
         summary_only: bool = False,
         limit: int | None = None,

@@ -713,11 +713,12 @@ class PostgresReadBackend(ReadBackend):
         self, method_name: str, *,
         repository: str | None = None,
         file_path: str | None = None,
+        entity_id: str | None = None,
     ) -> FunctionContext | None:
         pool = self._require_pool()
         symbol = await self._resolve_symbol(
             method_name, repository=repository, file_path=file_path,
-            entity_id=None, types=["Method", "Constructor"],
+            entity_id=entity_id, types=["Method", "Constructor"],
         )
         if not symbol:
             return None
@@ -736,11 +737,18 @@ class PostgresReadBackend(ReadBackend):
         """, symbol["id"], symbol.get("repository") or "")
         class_name = class_row["symbol_name"] if class_row else None
 
+        # Re-use the resolved symbol id so the caller/callee lookups
+        # cannot re-enter the ambiguity resolver under a broader filter
+        # set. This also honors the caller's entity_id choice end-to-end.
+        resolved_entity_id = symbol["id"]
+
         callers = await self.get_callers(
-            method_name, repository=repository, file_path=file_path, depth=1,
+            method_name, repository=repository, file_path=file_path,
+            entity_id=resolved_entity_id, depth=1,
         )
         callees = await self.get_callees(
-            method_name, repository=repository, file_path=file_path, depth=1,
+            method_name, repository=repository, file_path=file_path,
+            entity_id=resolved_entity_id, depth=1,
         )
 
         return FunctionContext(
@@ -1080,6 +1088,7 @@ class PostgresReadBackend(ReadBackend):
         self, method_name: str, *,
         repository: str | None = None,
         file_path: str | None = None,
+        entity_id: str | None = None,
         depth: int = 10,
         summary_only: bool = False,
         limit: int | None = None,
@@ -1087,7 +1096,7 @@ class PostgresReadBackend(ReadBackend):
         pool = self._require_pool()
         symbol = await self._resolve_symbol(
             method_name, repository=repository, file_path=file_path,
-            entity_id=None, types=["Method", "Constructor"],
+            entity_id=entity_id, types=["Method", "Constructor"],
         )
         if not symbol:
             return None

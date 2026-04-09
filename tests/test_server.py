@@ -165,6 +165,19 @@ class TestGetCallersTool:
         call_kwargs = mock_graph.get_callers.call_args.kwargs
         assert call_kwargs["limit"] == 80
 
+    async def test_get_callers_accepts_entity_id_for_chaining(self, mock_ctx, mock_graph):
+        """MCP tool must accept entity_id as an input parameter and pass it
+        through to the backend, enabling handle-first chained traversal from
+        a prior tool result's entity_id field."""
+        mock_graph.get_callers.return_value = []
+        await get_callers(
+            method_name="ignored",
+            entity_id="repo::Target.method",
+            ctx=mock_ctx,
+        )
+        call_kwargs = mock_graph.get_callers.call_args.kwargs
+        assert call_kwargs["entity_id"] == "repo::Target.method"
+
 
 # =============================================================================
 # get_callees
@@ -215,6 +228,19 @@ class TestGetCalleesTool:
         await get_callees(method_name="foo", limit=80, ctx=mock_ctx)
         call_kwargs = mock_graph.get_callees.call_args.kwargs
         assert call_kwargs["limit"] == 80
+
+    async def test_get_callees_accepts_entity_id_for_chaining(self, mock_ctx, mock_graph):
+        """MCP tool must accept entity_id as an input parameter and pass it
+        through to the backend, enabling handle-first chained traversal from
+        a prior tool result's entity_id field."""
+        mock_graph.get_callees.return_value = []
+        await get_callees(
+            method_name="ignored",
+            entity_id="repo::Target.method",
+            ctx=mock_ctx,
+        )
+        call_kwargs = mock_graph.get_callees.call_args.kwargs
+        assert call_kwargs["entity_id"] == "repo::Target.method"
 
 
 # =============================================================================
@@ -269,6 +295,30 @@ class TestGetFunctionContextTool:
         assert len(result["callees"]) == 1
         assert result["callees"][0]["name"] == "callee_fn"
         assert result["callees"][0]["entity_type"] == "hook"
+
+    async def test_get_function_context_accepts_entity_id_for_chaining(self, mock_ctx, mock_graph):
+        """MCP tool must accept entity_id as an input parameter and pass it
+        through to the backend, enabling handle-first chained traversal from
+        a prior tool result's entity_id field."""
+        mock_graph.get_function_context.return_value = FunctionContext(
+            name="my_func",
+            full_name="module.MyClass.my_func",
+            file_path="src/module.py",
+            repository="repo",
+            code="def my_func(): pass",
+            signature="def my_func()",
+            docstring=None,
+            class_name="MyClass",
+            callers=[],
+            callees=[],
+        )
+        await get_function_context(
+            method_name="ignored",
+            entity_id="repo::Target.method",
+            ctx=mock_ctx,
+        )
+        call_kwargs = mock_graph.get_function_context.call_args.kwargs
+        assert call_kwargs["entity_id"] == "repo::Target.method"
 
 
 # =============================================================================
@@ -741,3 +791,27 @@ class TestGetImpactTool:
         assert len(result["other_callers"]) == 1
         assert result["other_callers"][0]["name"] == "helper"
         assert result["truncated"] is False
+
+    async def test_get_impact_accepts_entity_id_for_chaining(self, mock_ctx, mock_graph):
+        """MCP tool must accept entity_id as an input parameter and pass it
+        through to the backend, enabling handle-first chained traversal from
+        a prior tool result's entity_id field."""
+        mock_graph.get_impact.return_value = ImpactResult(
+            target_name="process",
+            target_file="src/proc.py",
+            target_repository="repo",
+            total_callers=0,
+            test_count=0,
+            endpoint_count=0,
+            affected_tests=[],
+            affected_endpoints=[],
+            other_callers=[],
+            truncated=False,
+        )
+        await get_impact(
+            method_name="ignored",
+            entity_id="repo::Target.method",
+            ctx=mock_ctx,
+        )
+        call_kwargs = mock_graph.get_impact.call_args.kwargs
+        assert call_kwargs["entity_id"] == "repo::Target.method"

@@ -909,6 +909,29 @@ class TestGetFunctionContext:
         cypher_arg = graph_client._query.call_args[0][0]
         assert "(m:Method OR m:Constructor)" in cypher_arg
 
+    async def test_get_function_context_accepts_entity_id(self, graph_client):
+        """get_function_context must accept entity_id and use it in the
+        method match, bypassing name-based ambiguity resolution so agents
+        can chain from a prior tool result's entity_id field."""
+        graph_client._query = AsyncMock(return_value=[_make_function_context_result()])
+        graph_client.get_callers = AsyncMock(return_value=[])
+        graph_client.get_callees = AsyncMock(return_value=[])
+
+        await graph_client.get_function_context(
+            "ignored", entity_id="repo::Target.method"
+        )
+
+        kwargs = graph_client._query.call_args.kwargs
+        assert kwargs.get("entity_id") == "repo::Target.method", (
+            f"get_function_context must pass entity_id into Cypher params; "
+            f"got: {kwargs}"
+        )
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "m.id = $entity_id" in cypher_arg, (
+            f"get_function_context Cypher must constrain m.id = $entity_id; "
+            f"got: {cypher_arg}"
+        )
+
     async def test_get_function_context_with_filters(self, graph_client):
         """Verify file_path and repository filters work."""
         graph_client._query = AsyncMock(return_value=[_make_function_context_result()])
@@ -1899,6 +1922,30 @@ class TestGetImpact:
         kwargs = graph_client._query.call_args_list[1].kwargs
         assert "candidate_method.id ENDS WITH (candidate_method.name + $parameter_suffix)" in callers_cypher
         assert kwargs["parameter_suffix"] == "(String,int)"
+
+    async def test_get_impact_accepts_entity_id(self, graph_client):
+        """get_impact must accept entity_id and use it in the method match,
+        bypassing name-based ambiguity resolution so agents can chain from
+        a prior tool result's entity_id field."""
+        graph_client._query = AsyncMock(side_effect=[
+            [_make_impact_target(entity_id="repo::Target.method")],
+            [],
+        ])
+
+        await graph_client.get_impact("ignored", entity_id="repo::Target.method")
+
+        # The first _query call resolves the method target; it must
+        # pass entity_id through so the match uses m.id = $entity_id.
+        target_kwargs = graph_client._query.call_args_list[0].kwargs
+        assert target_kwargs.get("entity_id") == "repo::Target.method", (
+            f"get_impact must pass entity_id into the method match params; "
+            f"got: {target_kwargs}"
+        )
+        target_cypher = graph_client._query.call_args_list[0][0][0]
+        assert "m.id = $entity_id" in target_cypher, (
+            f"get_impact method match Cypher must constrain m.id = $entity_id; "
+            f"got: {target_cypher}"
+        )
 
 
 class TestFindSymbols:

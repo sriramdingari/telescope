@@ -1362,7 +1362,8 @@ class Neo4jReadBackend(ReadBackend):
             WHERE h.name = $hook_name
             MATCH (m)-[:USES_HOOK]->(h)
             WHERE (m:Method OR m:Constructor){filter_clause}
-            RETURN m.name AS name, m.file_path AS file_path,
+            RETURN m.id AS entity_id,
+                   m.name AS name, m.file_path AS file_path,
                    m.repository AS repository,
                    m.signature AS signature, m.line_number AS line_number,
                    head(labels(m)) AS entity_type, 'USES_HOOK' AS relationship_type
@@ -1377,6 +1378,7 @@ class Neo4jReadBackend(ReadBackend):
                 name=row["name"],
                 file_path=row["file_path"] or "",
                 repository=row.get("repository"),
+                entity_id=row.get("entity_id"),
                 signature=row.get("signature"),
                 line_start=row.get("line_number"),
                 entity_type=self._label_to_entity_type(row.get("entity_type")),

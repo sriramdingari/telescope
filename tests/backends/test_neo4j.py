@@ -643,6 +643,7 @@ class TestGetCallees:
         graph_client._query = AsyncMock(side_effect=[
             [
                 {
+                    "entity_id": "my-repo::com.example.Service.callee1",
                     "name": "callee1",
                     "file_path": "src/service.py",
                     "repository": "my-repo",
@@ -653,6 +654,7 @@ class TestGetCallees:
                     "depth": 1,
                 },
                 {
+                    "entity_id": "my-repo::requests.get",
                     "name": "requests.get",
                     "file_path": "src/dao.py",
                     "repository": "my-repo",
@@ -672,8 +674,10 @@ class TestGetCallees:
         assert by_name["callee1"].repository == "my-repo"
         assert by_name["callee1"].signature == "def callee1()"
         assert by_name["callee1"].entity_type == "method"
+        assert by_name["callee1"].entity_id == "my-repo::com.example.Service.callee1"
         assert by_name["requests.get"].entity_type == "reference"
         assert by_name["requests.get"].relationship_type == "CALLS"
+        assert by_name["requests.get"].entity_id == "my-repo::requests.get"
 
     async def test_get_callees_matches_method_or_constructor(self, graph_client):
         """Verify Cypher contains (m:Method OR m:Constructor)."""
@@ -755,6 +759,7 @@ class TestGetCallees:
             [],
             [
                 {
+                    "entity_id": "repo::hook.useState",
                     "name": "useState",
                     "file_path": "src/App.tsx",
                     "repository": "my-repo",
@@ -770,6 +775,7 @@ class TestGetCallees:
         assert results[0].name == "useState"
         assert results[0].entity_type == "hook"
         assert results[0].relationship_type == "USES_HOOK"
+        assert results[0].entity_id == "repo::hook.useState"
 
     async def test_get_callees_uses_limit_and_marks_truncation(self, graph_client):
         """Callee traversal should honor the merged result limit and mark truncation."""
@@ -1653,9 +1659,11 @@ def _make_impact_caller(
     line_number=30,
     stereotypes=None,
     depth=1,
+    entity_id="my-repo::Caller.default",
 ):
     """Helper to build a mock Neo4j result dict for get_impact callers."""
     return {
+        "entity_id": entity_id,
         "name": name,
         "file_path": file_path,
         "repository": repository,
@@ -1711,9 +1719,30 @@ class TestGetImpact:
         graph_client._query = AsyncMock(side_effect=[
             [_make_impact_target()],
             [
-                _make_impact_caller(name="testProcessOrder", file_path="test/OrderTest.java", stereotypes=["test"], line_number=15, depth=1),
-                _make_impact_caller(name="handleOrderEndpoint", file_path="src/OrderController.java", stereotypes=["endpoint"], line_number=20, depth=2),
-                _make_impact_caller(name="checkOrder", file_path="src/OrderHelper.java", stereotypes=[], line_number=30, depth=1),
+                _make_impact_caller(
+                    name="testProcessOrder",
+                    file_path="test/OrderTest.java",
+                    stereotypes=["test"],
+                    line_number=15,
+                    depth=1,
+                    entity_id="my-repo::OrderTest.testProcessOrder",
+                ),
+                _make_impact_caller(
+                    name="handleOrderEndpoint",
+                    file_path="src/OrderController.java",
+                    stereotypes=["endpoint"],
+                    line_number=20,
+                    depth=2,
+                    entity_id="my-repo::OrderController.handleOrderEndpoint",
+                ),
+                _make_impact_caller(
+                    name="checkOrder",
+                    file_path="src/OrderHelper.java",
+                    stereotypes=[],
+                    line_number=30,
+                    depth=1,
+                    entity_id="my-repo::OrderHelper.checkOrder",
+                ),
             ],
         ])
 
@@ -1722,13 +1751,17 @@ class TestGetImpact:
         assert len(result.affected_tests) == 1
         assert result.affected_tests[0].name == "testProcessOrder"
         assert result.affected_tests[0].is_test is True
+        # entity_id must propagate through so agents can chain without re-resolving
+        assert result.affected_tests[0].entity_id == "my-repo::OrderTest.testProcessOrder"
 
         assert len(result.affected_endpoints) == 1
         assert result.affected_endpoints[0].name == "handleOrderEndpoint"
         assert result.affected_endpoints[0].is_endpoint is True
+        assert result.affected_endpoints[0].entity_id == "my-repo::OrderController.handleOrderEndpoint"
 
         assert len(result.other_callers) == 1
         assert result.other_callers[0].name == "checkOrder"
+        assert result.other_callers[0].entity_id == "my-repo::OrderHelper.checkOrder"
 
     async def test_get_impact_fallback_heuristics(self, graph_client):
         """'test' in name -> is_test, 'controller' in name -> is_endpoint."""
@@ -2263,3 +2296,32 @@ class TestGetHookUsage:
         assert kwargs["query_limit"] == 3
         assert [result.name for result in results] == ["render1", "render2"]
         assert all(result.truncated is True for result in results)
+
+    async def test_get_hook_usage_returns_entity_id_for_chaining(self, graph_client):
+        """Backend parity with Postgres and with get_callers: hook-usage
+        results must carry entity_id so agents can chain to get_function_context
+        or get_callers without re-resolving by name."""
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "entity_id": "repo::App.renderApp",
+                "name": "renderApp",
+                "file_path": "src/App.tsx",
+                "repository": "repo",
+                "signature": "function renderApp()",
+                "line_number": 42,
+                "entity_type": "Method",
+                "relationship_type": "USES_HOOK",
+            },
+        ])
+
+        results = await graph_client.get_hook_usage("useState")
+
+        assert len(results) == 1
+        assert results[0].entity_id == "repo::App.renderApp", (
+            f"CallGraphNode.entity_id must be populated for hook usage; got: {results[0].entity_id}"
+        )
+        # Defensive: the Cypher RETURN must expose m.id AS entity_id
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "m.id AS entity_id" in cypher_arg, (
+            f"get_hook_usage Cypher RETURN must expose m.id AS entity_id; got: {cypher_arg}"
+        )

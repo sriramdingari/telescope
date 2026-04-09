@@ -18,8 +18,8 @@ class TestConstellationContract:
 
         assert repo_context is not None
         assert repo_context.name == repository
-        # Fixture repo has 3 files: Service.java, App.tsx, AuthService.cs
-        assert repo_context.total_files == 3
+        # Fixture repo has 4 files: Service.java, App.tsx, AuthService.cs, demo.py
+        assert repo_context.total_files == 4
         assert "java" in repo_context.languages
         assert "javascript" in repo_context.languages
         assert "csharp" in repo_context.languages
@@ -181,3 +181,23 @@ class TestConstellationContract:
             f"codebase_overview.packages must show the full dotted name; got: {overview.packages}"
         assert "Services" not in overview.packages, \
             f"Leaf-only 'Services' must not appear in codebase_overview.packages; got: {overview.packages}"
+
+    async def test_python_cross_file_calls_surface_as_references(
+        self,
+        live_graph_client,
+        seeded_contract_repository,
+    ):
+        """Symmetric to the Postgres contract assertion. Before Sub-plan A,
+        cross-file Python CALLS created orphan Neo4j nodes with no label
+        match; now they resolve to Reference nodes via the Java-parity
+        pattern ported in constellation/parsers/python_parser.py."""
+        repository = seeded_contract_repository
+        callees = await live_graph_client.get_callees(
+            "run",
+            repository=repository,
+            file_path="demo.py",
+        )
+        reference_callees = [c for c in callees if c.entity_type == "reference"]
+        reference_names = {c.name for c in reference_callees}
+        assert "load_config" in reference_names
+        assert "redis.from_url" in reference_names

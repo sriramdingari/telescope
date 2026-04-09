@@ -57,8 +57,8 @@ class TestPostgresContractHappyPaths:
         repo_context = await pg_read_backend.get_repository_context(repository)
         assert repo_context is not None
         assert repo_context.name == repository
-        # Fixture repo has 3 files: Service.java, App.tsx, AuthService.cs
-        assert repo_context.total_files == 3
+        # Fixture repo has 4 files: Service.java, App.tsx, AuthService.cs, demo.py
+        assert repo_context.total_files == 4
         assert "java" in repo_context.languages
         assert "javascript" in repo_context.languages
         assert "csharp" in repo_context.languages
@@ -292,3 +292,36 @@ class TestPostgresContractTaskCoverage:
             f"codebase_overview.packages must show the full dotted name; got: {overview.packages}"
         assert "Services" not in overview.packages, \
             f"Leaf-only 'Services' must not appear in codebase_overview.packages; got: {overview.packages}"
+
+    async def test_python_cross_file_calls_surface_as_references(
+        self, pg_read_backend, seeded_postgres_contract_repository,
+    ):
+        """Sub-plan A (Constellation Python parser fix): cross-file Python
+        calls must emit Reference entities so Telescope's get_callees can
+        surface them. Before the fix, Postgres silently dropped these
+        relationships via the EXISTS filter in _upsert_relationships.
+
+        Fixture: tests/fixtures/contract_repo/src/py/demo.py has a
+        top-level function `run` that calls load_config (identifier,
+        unresolved), redis.from_url (attribute on unknown module,
+        unresolved), and client.get (attribute on unresolved receiver).
+        All three should surface as Reference callees.
+        """
+        repository = seeded_postgres_contract_repository
+
+        callees = await pg_read_backend.get_callees(
+            "run",
+            repository=repository,
+            file_path="demo.py",
+        )
+
+        reference_callees = [c for c in callees if c.entity_type == "reference"]
+        reference_names = {c.name for c in reference_callees}
+        assert "load_config" in reference_names, (
+            f"Expected 'load_config' as a Reference callee; got: "
+            f"{[(c.name, c.entity_type) for c in callees]}"
+        )
+        assert "redis.from_url" in reference_names, (
+            f"Expected 'redis.from_url' as a Reference callee; got: "
+            f"{[(c.name, c.entity_type) for c in callees]}"
+        )

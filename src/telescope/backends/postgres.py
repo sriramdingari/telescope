@@ -578,6 +578,7 @@ class PostgresReadBackend(ReadBackend):
                 JOIN code_symbols s ON s.id = r.source_symbol_id
                 WHERE r.target_symbol_id = ANY($1)
                   AND r.ref_type = 'CALLS'
+                  AND s.symbol_type IN ('Method', 'Constructor')
                   AND s.id != ALL($1)
                 UNION
                 SELECT s.id, s.symbol_name, s.file_path, s.repository,
@@ -587,6 +588,7 @@ class PostgresReadBackend(ReadBackend):
                 JOIN code_symbols s ON s.id = r.source_symbol_id
                 JOIN callers c ON c.id = r.target_symbol_id
                 WHERE c.depth < $2
+                  AND s.symbol_type IN ('Method', 'Constructor')
                   AND s.id != ALL($1)
             )
             SELECT DISTINCT ON (id) * FROM callers ORDER BY id, depth
@@ -627,7 +629,9 @@ class PostgresReadBackend(ReadBackend):
                        s.is_test, s.is_endpoint, 1 AS depth
                 FROM code_references r
                 JOIN code_symbols s ON s.id = r.target_symbol_id
-                WHERE r.source_symbol_id = ANY($1) AND r.ref_type = 'CALLS'
+                WHERE r.source_symbol_id = ANY($1)
+                  AND r.ref_type = 'CALLS'
+                  AND s.symbol_type IN ('Method', 'Constructor', 'Reference')
                 UNION
                 SELECT s.id, s.symbol_name, s.file_path, s.repository,
                        s.signature, s.line_start, s.symbol_type,
@@ -636,6 +640,7 @@ class PostgresReadBackend(ReadBackend):
                 JOIN code_symbols s ON s.id = r.target_symbol_id
                 JOIN callees c ON c.id = r.source_symbol_id
                 WHERE c.depth < $2
+                  AND s.symbol_type IN ('Method', 'Constructor', 'Reference')
             )
             SELECT DISTINCT ON (id) * FROM callees ORDER BY id, depth
             LIMIT $3
@@ -1104,6 +1109,7 @@ class PostgresReadBackend(ReadBackend):
                 JOIN code_symbols s ON s.id = r.source_symbol_id
                 WHERE r.target_symbol_id = ANY($1)
                   AND r.ref_type = 'CALLS'
+                  AND s.symbol_type IN ('Method', 'Constructor')
                   AND s.id != ALL($1)
                 UNION
                 SELECT s.id, s.symbol_name, s.file_path, s.repository,
@@ -1113,6 +1119,7 @@ class PostgresReadBackend(ReadBackend):
                 JOIN code_symbols s ON s.id = r.source_symbol_id
                 JOIN callers c ON c.id = r.target_symbol_id
                 WHERE c.depth < $2
+                  AND s.symbol_type IN ('Method', 'Constructor')
                   AND s.id != ALL($1)
             )
             SELECT DISTINCT ON (id) * FROM callers ORDER BY id, depth

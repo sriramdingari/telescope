@@ -1563,6 +1563,93 @@ async def test_get_callees_limit_one_returns_single_call(backend, mock_pool):
 
 
 @pytest.mark.asyncio
+async def test_get_callers_excludes_non_method_symbol_types(backend, mock_pool):
+    """get_callers must filter out any source with symbol_type not in
+    ('Method', 'Constructor'). A File, Class, or Package should never
+    appear as a caller in a call-graph traversal. Mirrors Neo4j's
+    WHERE caller:Method OR caller:Constructor (neo4j.py:641).
+    """
+    async def fake_resolve(*args, **kwargs):
+        return {"id": "repo::Target.method", "symbol_name": "method",
+                "file_path": "target.py", "repository": "repo"}
+    backend._resolve_symbol = fake_resolve
+    backend._resolve_method_family = AsyncMock(return_value=["repo::Target.method"])
+
+    # Capture the SQL to assert the filter clause is present.
+    captured_sqls: list[str] = []
+    async def fetch_side_effect(sql, *args, **kwargs):
+        captured_sqls.append(sql)
+        return []  # filter works correctly → no rows returned
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    await backend.get_callers("method")
+
+    # Find the CTE query and assert the filter is present
+    call_graph_sqls = [s for s in captured_sqls if "RECURSIVE callers" in s]
+    assert call_graph_sqls, f"Expected recursive callers CTE; got: {captured_sqls}"
+    cte_sql = call_graph_sqls[0]
+    assert "s.symbol_type IN ('Method', 'Constructor')" in cte_sql, (
+        f"get_callers CTE must filter by symbol_type; got: {cte_sql}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_callees_excludes_non_callable_symbol_types(backend, mock_pool):
+    """get_callees must filter target symbol_type to ('Method',
+    'Constructor', 'Reference') — matching Neo4j at neo4j.py:697.
+    Files, Classes, and Packages must never appear as callees.
+    """
+    async def fake_resolve(*args, **kwargs):
+        return {"id": "repo::Target.method", "symbol_name": "method",
+                "file_path": "target.py", "repository": "repo"}
+    backend._resolve_symbol = fake_resolve
+    backend._resolve_method_family = AsyncMock(return_value=["repo::Target.method"])
+
+    captured_sqls: list[str] = []
+    async def fetch_side_effect(sql, *args, **kwargs):
+        captured_sqls.append(sql)
+        return []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    await backend.get_callees("method")
+
+    call_graph_sqls = [s for s in captured_sqls if "RECURSIVE callees" in s]
+    assert call_graph_sqls, f"Expected recursive callees CTE; got: {captured_sqls}"
+    cte_sql = call_graph_sqls[0]
+    assert "s.symbol_type IN ('Method', 'Constructor', 'Reference')" in cte_sql, (
+        f"get_callees CTE must filter target symbol_type; got: {cte_sql}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_impact_excludes_non_method_symbol_types(backend, mock_pool):
+    """get_impact's caller CTE has the same shape as get_callers and
+    must apply the same symbol_type filter. File nodes must never
+    appear in impact blast-radius results.
+    """
+    async def fake_resolve(*args, **kwargs):
+        return {"id": "repo::Target.method", "symbol_name": "method",
+                "file_path": "target.py", "repository": "repo"}
+    backend._resolve_symbol = fake_resolve
+    backend._resolve_method_family = AsyncMock(return_value=["repo::Target.method"])
+
+    captured_sqls: list[str] = []
+    async def fetch_side_effect(sql, *args, **kwargs):
+        captured_sqls.append(sql)
+        return []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    await backend.get_impact("method")
+
+    call_graph_sqls = [s for s in captured_sqls if "RECURSIVE callers" in s]
+    assert call_graph_sqls, f"Expected recursive impact CTE; got: {captured_sqls}"
+    cte_sql = call_graph_sqls[0]
+    assert "s.symbol_type IN ('Method', 'Constructor')" in cte_sql, (
+        f"get_impact CTE must filter symbol_type; got: {cte_sql}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_get_hook_usage_sets_truncated_when_limit_exceeded(backend, mock_pool):
     """get_hook_usage must signal truncation when more hook users exist
     than the limit."""

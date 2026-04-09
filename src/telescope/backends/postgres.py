@@ -1228,24 +1228,30 @@ class PostgresReadBackend(ReadBackend):
         if repository:
             ep_query = """
                 SELECT symbol_name, file_path FROM code_symbols
-                WHERE repository = $1 AND ('endpoint' = ANY(stereotypes) OR symbol_name = 'main')
+                WHERE repository = $1
+                  AND ('endpoint' = ANY(stereotypes) OR symbol_name = 'main')
+                  AND is_test = false
                 LIMIT 20
             """
             entry_points = await pool.fetch(ep_query, repository)
         else:
             entry_points = await pool.fetch("""
                 SELECT symbol_name, file_path FROM code_symbols
-                WHERE 'endpoint' = ANY(stereotypes) OR symbol_name = 'main'
+                WHERE ('endpoint' = ANY(stereotypes) OR symbol_name = 'main')
+                  AND is_test = false
                 LIMIT 20
             """)
 
         if repository:
             tc_query = """
                 SELECT s.symbol_name FROM code_symbols s
-                WHERE s.symbol_type = 'Class' AND s.repository = $1
-                AND s.id NOT IN (
-                    SELECT source_symbol_id FROM code_references WHERE ref_type = 'EXTENDS'
-                )
+                WHERE s.symbol_type = 'Class'
+                  AND s.repository = $1
+                  AND s.is_test = false
+                  AND s.id NOT IN (
+                      SELECT source_symbol_id FROM code_references WHERE ref_type = 'EXTENDS'
+                  )
+                ORDER BY s.symbol_name
                 LIMIT 20
             """
             top_classes = await pool.fetch(tc_query, repository)
@@ -1253,9 +1259,11 @@ class PostgresReadBackend(ReadBackend):
             top_classes = await pool.fetch("""
                 SELECT s.symbol_name FROM code_symbols s
                 WHERE s.symbol_type = 'Class'
-                AND s.id NOT IN (
-                    SELECT source_symbol_id FROM code_references WHERE ref_type = 'EXTENDS'
-                )
+                  AND s.is_test = false
+                  AND s.id NOT IN (
+                      SELECT source_symbol_id FROM code_references WHERE ref_type = 'EXTENDS'
+                  )
+                ORDER BY s.symbol_name
                 LIMIT 20
             """)
 

@@ -872,6 +872,53 @@ async def test_get_codebase_overview_reconstructs_nested_dotnet_namespaces(
 
 
 @pytest.mark.asyncio
+async def test_get_codebase_overview_excludes_test_entities(backend, mock_pool):
+    """top_level_classes and entry_points must exclude is_test=true
+    rows so the overview surfaces production code, not test fixtures.
+    """
+    counts: list = []
+    langs: list = []
+    # Mock entry_points query — should return only production entities
+    entry_points_rows = [
+        {"symbol_name": "main", "file_path": "src/main.py"},
+    ]
+    # Mock top_classes query — should return only production classes
+    top_classes_rows = [
+        {"symbol_name": "UserService"},
+        {"symbol_name": "PaymentProcessor"},
+    ]
+    export_count = [{"cnt": 3}]
+
+    captured_sqls: list[str] = []
+    call_count = {"n": 0}
+    fetch_sequence = [counts, langs, entry_points_rows, top_classes_rows, export_count]
+
+    async def fetch_side_effect(sql, *args, **kwargs):
+        captured_sqls.append(sql)
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return fetch_sequence[idx] if idx < len(fetch_sequence) else []
+    mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
+
+    result = await backend.get_codebase_overview(repository="repo")
+
+    # Find the entry_points and top_classes SQLs
+    ep_sqls = [s for s in captured_sqls if "endpoint" in s and "stereotypes" in s]
+    tc_sqls = [s for s in captured_sqls
+               if "NOT IN" in s and "EXTENDS" in s]
+
+    assert ep_sqls, f"Expected entry_points query; got: {captured_sqls}"
+    assert tc_sqls, f"Expected top_classes query; got: {captured_sqls}"
+
+    assert "is_test = false" in ep_sqls[0] or "NOT is_test" in ep_sqls[0], (
+        f"entry_points query must exclude is_test; got: {ep_sqls[0]}"
+    )
+    assert "is_test = false" in tc_sqls[0] or "NOT is_test" in tc_sqls[0], (
+        f"top_classes query must exclude is_test; got: {tc_sqls[0]}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_get_package_context_populates_hooks_and_references(backend, mock_pool):
     """get_package_context must populate hooks and references as direct
     IN_PACKAGE members, not via a two-hop traversal. Matches Neo4j semantics."""

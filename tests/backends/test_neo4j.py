@@ -1489,6 +1489,32 @@ class TestGetCodebaseOverview:
 
         assert result.entry_points == ["ApiController.handleRequest", "main"]
 
+    async def test_get_codebase_overview_excludes_test_entities(self, graph_client):
+        """top_level_classes and entry_points must exclude is_test=true
+        rows via a Cypher filter, symmetric to the Postgres fix."""
+        graph_client._query = AsyncMock(side_effect=[
+            [{
+                "files": 10, "classes": 5, "interfaces": 2,
+                "methods": 20, "constructors": 3, "fields": 6,
+                "packages_count": 2, "hooks": 0, "references": 1,
+                "exports": 4, "languages": ["Python"],
+            }],
+            [],  # top classes
+            [],  # entry points
+        ])
+
+        await graph_client.get_codebase_overview(repository="repo")
+
+        top_classes_cypher = graph_client._query.call_args_list[1][0][0]
+        assert "NOT c.is_test" in top_classes_cypher or "is_test = false" in top_classes_cypher, (
+            f"Neo4j top_classes Cypher must exclude is_test; got: {top_classes_cypher}"
+        )
+
+        entry_points_cypher = graph_client._query.call_args_list[2][0][0]
+        assert "NOT m.is_test" in entry_points_cypher or "is_test = false" in entry_points_cypher, (
+            f"Neo4j entry_points Cypher must exclude is_test; got: {entry_points_cypher}"
+        )
+
     async def test_get_codebase_overview_empty_results(self, graph_client):
         """Returns CodebaseOverview with defaults when no data."""
         graph_client._query = AsyncMock(return_value=[])

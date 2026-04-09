@@ -1740,6 +1740,38 @@ async def test_get_callers_excludes_non_method_symbol_types(backend, mock_pool):
 
 
 @pytest.mark.asyncio
+async def test_get_callers_returns_entity_id_for_chaining(backend, mock_pool):
+    """CallGraphNode must carry entity_id so agents can chain
+    get_callers → get_callers(entity_id=...) without re-resolving
+    by name (which reintroduces ambiguity)."""
+    async def fake_resolve(*args, **kwargs):
+        return {"id": "repo::Target.method", "symbol_name": "method",
+                "file_path": "target.py", "repository": "repo"}
+    backend._resolve_symbol = fake_resolve
+    backend._resolve_method_family = AsyncMock(return_value=["repo::Target.method"])
+
+    mock_pool.fetch = AsyncMock(return_value=[{
+        "id": "repo::Caller.call_method",
+        "symbol_name": "call_method",
+        "file_path": "caller.py",
+        "repository": "repo",
+        "signature": "def call_method(self)",
+        "line_start": 5,
+        "symbol_type": "Method",
+        "is_test": False,
+        "is_endpoint": False,
+        "depth": 1,
+    }])
+
+    result = await backend.get_callers("method")
+
+    assert len(result) == 1
+    assert result[0].entity_id == "repo::Caller.call_method", (
+        f"CallGraphNode.entity_id must be populated; got: {result[0].entity_id}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_get_callees_excludes_non_callable_symbol_types(backend, mock_pool):
     """get_callees must filter target symbol_type to ('Method',
     'Constructor', 'Reference') — matching Neo4j at neo4j.py:697.

@@ -660,7 +660,8 @@ class Neo4jReadBackend(ReadBackend):
             MATCH path = (caller)-[:CALLS*1..{depth}]->(method)
             WHERE caller:Method OR caller:Constructor
             WITH caller, min(length(path)) AS depth
-            RETURN DISTINCT caller.name AS name, caller.file_path AS file_path,
+            RETURN DISTINCT caller.id AS entity_id,
+                   caller.name AS name, caller.file_path AS file_path,
                    caller.repository AS repository,
                    caller.signature AS signature, caller.line_number AS line_number,
                    head(labels(caller)) AS entity_type, 'CALLS' AS relationship_type,
@@ -678,6 +679,7 @@ class Neo4jReadBackend(ReadBackend):
                 name=r["name"],
                 file_path=r["file_path"] or "",
                 repository=r.get("repository"),
+                entity_id=r.get("entity_id"),
                 signature=r.get("signature"),
                 line_start=r.get("line_number"),
                 depth=r.get("depth", 1),
@@ -716,7 +718,8 @@ class Neo4jReadBackend(ReadBackend):
             MATCH path = (method)-[:CALLS*1..{depth}]->(callee)
             WHERE callee:Method OR callee:Constructor OR callee:Reference
             WITH callee, min(length(path)) AS depth
-            RETURN DISTINCT callee.name AS name, callee.file_path AS file_path,
+            RETURN DISTINCT callee.id AS entity_id,
+                   callee.name AS name, callee.file_path AS file_path,
                    callee.repository AS repository,
                    callee.signature AS signature, callee.line_number AS line_number,
                    head(labels(callee)) AS entity_type, 'CALLS' AS relationship_type,
@@ -729,7 +732,8 @@ class Neo4jReadBackend(ReadBackend):
             {match_clause}
             {self._method_family_fragment("m")}
             MATCH (method)-[:USES_HOOK]->(hook:Hook)
-            RETURN DISTINCT hook.name AS name, hook.file_path AS file_path,
+            RETURN DISTINCT hook.id AS entity_id,
+                   hook.name AS name, hook.file_path AS file_path,
                    hook.repository AS repository,
                    hook.line_number AS line_number,
                    'Hook' AS entity_type, 'USES_HOOK' AS relationship_type,
@@ -767,6 +771,7 @@ class Neo4jReadBackend(ReadBackend):
                 name=r["name"],
                 file_path=r["file_path"] or "",
                 repository=r.get("repository"),
+                entity_id=r.get("entity_id"),
                 signature=r.get("signature"),
                 line_start=r.get("line_number"),
                 depth=r.get("depth", 1),
@@ -1407,7 +1412,8 @@ class Neo4jReadBackend(ReadBackend):
             MATCH path = (caller)-[:CALLS*1..{depth}]->(method)
             WHERE (caller:Method OR caller:Constructor) AND caller <> m AND caller <> method
             WITH caller, min(length(path)) AS depth
-            RETURN caller.name AS name, caller.file_path AS file_path,
+            RETURN caller.id AS entity_id,
+                   caller.name AS name, caller.file_path AS file_path,
                    caller.repository AS repository,
                    caller.signature AS signature, caller.line_number AS line_number,
                    caller.stereotypes AS stereotypes,
@@ -1442,6 +1448,7 @@ class Neo4jReadBackend(ReadBackend):
                 name=r["name"],
                 file_path=r["file_path"] or "",
                 repository=r.get("repository"),
+                entity_id=r.get("entity_id"),
                 signature=r.get("signature"),
                 line_start=r.get("line_number"),
                 depth=r.get("depth", 1),

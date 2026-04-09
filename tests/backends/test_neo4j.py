@@ -604,6 +604,36 @@ class TestGetCallers:
         assert [result.name for result in results] == ["caller1", "caller2"]
         assert all(result.truncated is True for result in results)
 
+    async def test_get_callers_returns_entity_id_for_chaining(self, graph_client):
+        """CallGraphNode must carry entity_id so agents can chain
+        get_callers → get_callers(entity_id=...) without re-resolving
+        by name. Symmetric to the Postgres fix."""
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "entity_id": "repo::Caller.call_method",
+                "name": "call_method",
+                "file_path": "caller.py",
+                "repository": "repo",
+                "signature": "def call_method(self)",
+                "line_number": 5,
+                "entity_type": "Method",
+                "relationship_type": "CALLS",
+                "depth": 1,
+            },
+        ])
+
+        results = await graph_client.get_callers("method")
+
+        assert len(results) == 1
+        assert results[0].entity_id == "repo::Caller.call_method", (
+            f"CallGraphNode.entity_id must be populated; got: {results[0].entity_id}"
+        )
+        # The Cypher RETURN must expose caller.id AS entity_id
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "caller.id AS entity_id" in cypher_arg, (
+            f"get_callers Cypher RETURN must expose caller.id AS entity_id; got: {cypher_arg}"
+        )
+
 
 class TestGetCallees:
     """Tests for Neo4jReadBackend.get_callees()."""

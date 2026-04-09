@@ -141,6 +141,7 @@ class TestGetCallersTool:
                 entity_type="method",
                 relationship_type="CALLS",
                 truncated=True,
+                entity_id="my-repo::handler.handle_request",
             ),
         ]
         result = await get_callers(method_name="process", ctx=mock_ctx)
@@ -155,6 +156,7 @@ class TestGetCallersTool:
             "entity_type": "method",
             "relationship_type": "CALLS",
             "truncated": True,
+            "entity_id": "my-repo::handler.handle_request",
         }
 
     async def test_passes_limit_through_to_graph(self, mock_ctx, mock_graph):
@@ -190,6 +192,7 @@ class TestGetCalleesTool:
                 entity_type="reference",
                 relationship_type="CALLS",
                 truncated=True,
+                entity_id="my-repo::db.query_db",
             ),
         ]
         result = await get_callees(method_name="process", ctx=mock_ctx)
@@ -204,6 +207,7 @@ class TestGetCalleesTool:
             "entity_type": "reference",
             "relationship_type": "CALLS",
             "truncated": True,
+            "entity_id": "my-repo::db.query_db",
         }
 
     async def test_passes_limit_through_to_graph(self, mock_ctx, mock_graph):
@@ -642,6 +646,7 @@ class TestGetHookUsageTool:
                 entity_type="method",
                 relationship_type="USES_HOOK",
                 truncated=True,
+                entity_id="repo::App.renderApp",
             ),
         ]
         result = await get_hook_usage(hook_name="useState", ctx=mock_ctx)
@@ -656,6 +661,7 @@ class TestGetHookUsageTool:
                 "entity_type": "method",
                 "relationship_type": "USES_HOOK",
                 "truncated": True,
+                "entity_id": "repo::App.renderApp",
             },
         ]
 

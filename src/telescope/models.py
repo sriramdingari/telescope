@@ -32,6 +32,7 @@ class CallGraphNode:
     name: str
     file_path: str
     repository: str | None = None
+    entity_id: str | None = None
     signature: str | None = None
     line_start: int | None = None
     depth: int = 1

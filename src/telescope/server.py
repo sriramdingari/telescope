@@ -162,6 +162,7 @@ def _call_node_to_dict(node) -> dict:
         "entity_type": node.entity_type,
         "relationship_type": node.relationship_type,
         "truncated": node.truncated,
+        "entity_id": node.entity_id,
     }
 
 

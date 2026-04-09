@@ -328,6 +328,7 @@ class PostgresReadBackend(ReadBackend):
             name=row["symbol_name"],
             file_path=row["file_path"],
             repository=row.get("repository"),
+            entity_id=row.get("id"),
             signature=row.get("signature"),
             line_start=row.get("line_start"),
             depth=row.get("depth", 1),

@@ -199,5 +199,7 @@ class TestConstellationContract:
         )
         reference_callees = [c for c in callees if c.entity_type == "reference"]
         reference_names = {c.name for c in reference_callees}
-        assert "load_config" in reference_names
-        assert "redis.from_url" in reference_names
+        assert reference_names == {"load_config", "redis.from_url", "client.get"}, (
+            f"Expected all three unresolved calls as Reference callees; got: "
+            f"{[(c.name, c.entity_type) for c in callees]}"
+        )

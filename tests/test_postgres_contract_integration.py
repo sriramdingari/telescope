@@ -315,13 +315,14 @@ class TestPostgresContractTaskCoverage:
             file_path="demo.py",
         )
 
+        # All three unresolved calls should surface as References per
+        # Sub-plan A's Java-parity two-pass pattern in
+        # constellation/parsers/python_parser.py. Using exact-set equality
+        # catches both dropped emissions and spurious additions (e.g., a
+        # future refactor that double-emits or leaks aliases).
         reference_callees = [c for c in callees if c.entity_type == "reference"]
         reference_names = {c.name for c in reference_callees}
-        assert "load_config" in reference_names, (
-            f"Expected 'load_config' as a Reference callee; got: "
-            f"{[(c.name, c.entity_type) for c in callees]}"
-        )
-        assert "redis.from_url" in reference_names, (
-            f"Expected 'redis.from_url' as a Reference callee; got: "
+        assert reference_names == {"load_config", "redis.from_url", "client.get"}, (
+            f"Expected all three unresolved calls as Reference callees; got: "
             f"{[(c.name, c.entity_type) for c in callees]}"
         )

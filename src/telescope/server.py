@@ -242,8 +242,8 @@ async def search_code(
 
 @mcp.tool()
 async def get_callers(
-    method_name: str,
     ctx: Context[ServerSession, AppContext],
+    method_name: str | None = None,
     repository: str | None = None,
     file_path: str | None = None,
     entity_id: str | None = None,
@@ -256,7 +256,7 @@ async def get_callers(
     Use this to understand the impact of changing a function - who depends on it?
 
     Args:
-        method_name: Name of the method to find callers for (ignored if entity_id is set)
+        method_name: Name of the method to find callers for (required unless entity_id is set)
         repository: Filter by repository name (e.g., "consumer-operations")
         file_path: Disambiguate if multiple methods have the same name
         entity_id: Exact graph entity id from a prior tool result (bypasses name-based
@@ -268,6 +268,11 @@ async def get_callers(
         List of functions that call this method. Each result includes
         a `truncated` flag when additional callers exist beyond the limit.
     """
+    if not method_name and not entity_id:
+        raise ValueError(
+            "Must provide either method_name or entity_id"
+        )
+
     graph = ctx.request_context.lifespan_context.graph
 
     results = await graph.get_callers(
@@ -284,8 +289,8 @@ async def get_callers(
 
 @mcp.tool()
 async def get_callees(
-    method_name: str,
     ctx: Context[ServerSession, AppContext],
+    method_name: str | None = None,
     repository: str | None = None,
     file_path: str | None = None,
     entity_id: str | None = None,
@@ -298,7 +303,7 @@ async def get_callees(
     Use this to understand what a method depends on before modifying it.
 
     Args:
-        method_name: Name of the method to analyze (ignored if entity_id is set)
+        method_name: Name of the method to analyze (required unless entity_id is set)
         repository: Filter by repository name (e.g., "consumer-operations")
         file_path: Disambiguate if multiple methods have the same name
         entity_id: Exact graph entity id from a prior tool result (bypasses name-based
@@ -310,6 +315,11 @@ async def get_callees(
         List of methods, constructors, references, and hooks reached from this method.
         Each result includes a `truncated` flag when additional targets exist.
     """
+    if not method_name and not entity_id:
+        raise ValueError(
+            "Must provide either method_name or entity_id"
+        )
+
     graph = ctx.request_context.lifespan_context.graph
 
     results = await graph.get_callees(
@@ -326,8 +336,8 @@ async def get_callees(
 
 @mcp.tool()
 async def get_function_context(
-    method_name: str,
     ctx: Context[ServerSession, AppContext],
+    method_name: str | None = None,
     repository: str | None = None,
     file_path: str | None = None,
     entity_id: str | None = None,
@@ -339,7 +349,7 @@ async def get_function_context(
     This is the go-to tool before making changes to understand full impact.
 
     Args:
-        method_name: Name of the method (ignored if entity_id is set)
+        method_name: Name of the method (required unless entity_id is set)
         repository: Filter by repository name (e.g., "consumer-operations")
         file_path: Disambiguate if multiple methods have the same name
         entity_id: Exact graph entity id from a prior tool result (bypasses name-based
@@ -348,6 +358,11 @@ async def get_function_context(
     Returns:
         Full context including code and relationships
     """
+    if not method_name and not entity_id:
+        raise ValueError(
+            "Must provide either method_name or entity_id"
+        )
+
     graph = ctx.request_context.lifespan_context.graph
 
     result = await graph.get_function_context(
@@ -674,8 +689,8 @@ async def get_hook_usage(
 
 @mcp.tool()
 async def get_impact(
-    method_name: str,
     ctx: Context[ServerSession, AppContext],
+    method_name: str | None = None,
     repository: str | None = None,
     file_path: str | None = None,
     entity_id: str | None = None,
@@ -692,7 +707,7 @@ async def get_impact(
     Use this BEFORE making changes to understand full impact.
 
     Args:
-        method_name: Name of the method to analyze (ignored if entity_id is set)
+        method_name: Name of the method to analyze (required unless entity_id is set)
         repository: Filter by repository name
         file_path: Disambiguate if multiple methods have same name
         entity_id: Exact graph entity id from a prior tool result (bypasses name-based
@@ -714,6 +729,11 @@ async def get_impact(
         # Full details (default, use for small methods)
         get_impact("validateUser")
     """
+    if not method_name and not entity_id:
+        raise ValueError(
+            "Must provide either method_name or entity_id"
+        )
+
     graph = ctx.request_context.lifespan_context.graph
 
     result = await graph.get_impact(
@@ -737,15 +757,18 @@ async def get_impact(
         "test_count": result.test_count,
         "endpoint_count": result.endpoint_count,
         "affected_tests": [
-            {"name": c.name, "file_path": c.file_path, "repository": c.repository, "depth": c.depth}
+            {"name": c.name, "file_path": c.file_path, "repository": c.repository,
+             "entity_id": c.entity_id, "depth": c.depth}
             for c in result.affected_tests
         ],
         "affected_endpoints": [
-            {"name": c.name, "file_path": c.file_path, "repository": c.repository, "depth": c.depth}
+            {"name": c.name, "file_path": c.file_path, "repository": c.repository,
+             "entity_id": c.entity_id, "depth": c.depth}
             for c in result.affected_endpoints
         ],
         "other_callers": [
-            {"name": c.name, "file_path": c.file_path, "repository": c.repository, "depth": c.depth}
+            {"name": c.name, "file_path": c.file_path, "repository": c.repository,
+             "entity_id": c.entity_id, "depth": c.depth}
             for c in result.other_callers
         ],
         "truncated": result.truncated,

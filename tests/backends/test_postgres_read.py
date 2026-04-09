@@ -2000,6 +2000,71 @@ async def test_get_file_context_raises_on_ambiguous_suffix(backend, mock_pool):
 
 
 @pytest.mark.asyncio
+async def test_get_file_context_ambiguity_message_when_repo_provided(backend, mock_pool):
+    """When repository is already provided and the path is still
+    ambiguous, the error message must NOT suggest 'Provide repository='.
+    It should guide the user toward a longer suffix or entity_id=."""
+    row1 = {
+        "id": "repo::File::src/a/tasks.py",
+        "symbol_name": "tasks.py",
+        "file_path": "src/a/tasks.py",
+        "repository": "repo",
+        "symbol_type": "File",
+    }
+    row2 = {
+        "id": "repo::File::src/b/tasks.py",
+        "symbol_name": "tasks.py",
+        "file_path": "src/b/tasks.py",
+        "repository": "repo",
+        "symbol_type": "File",
+    }
+    mock_pool.fetch = AsyncMock(return_value=[row1, row2])
+
+    with pytest.raises(ValueError) as excinfo:
+        await backend.get_file_context("tasks.py", repository="repo")
+
+    msg = str(excinfo.value)
+    assert "mbiguous" in msg
+    assert "longer path suffix" in msg or "longer suffix" in msg
+    # CRITICAL: do not suggest 'repository=' when it was already provided
+    assert "Provide repository=" not in msg, (
+        f"Error must not suggest 'Provide repository=' when repo was "
+        f"already provided; got: {msg}"
+    )
+    # Should mention the matching paths for debuggability
+    assert "src/a/tasks.py" in msg
+    assert "src/b/tasks.py" in msg
+
+
+@pytest.mark.asyncio
+async def test_get_file_context_ambiguity_message_without_repo(backend, mock_pool):
+    """When repository is NOT provided and the path is ambiguous,
+    the error SHOULD suggest 'Provide repository=' as one option."""
+    row1 = {
+        "id": "repo1::File::tasks.py",
+        "symbol_name": "tasks.py",
+        "file_path": "tasks.py",
+        "repository": "repo1",
+        "symbol_type": "File",
+    }
+    row2 = {
+        "id": "repo2::File::tasks.py",
+        "symbol_name": "tasks.py",
+        "file_path": "tasks.py",
+        "repository": "repo2",
+        "symbol_type": "File",
+    }
+    mock_pool.fetch = AsyncMock(return_value=[row1, row2])
+
+    with pytest.raises(ValueError) as excinfo:
+        await backend.get_file_context("tasks.py")  # no repository
+
+    msg = str(excinfo.value)
+    assert "mbiguous" in msg
+    assert "Provide repository=" in msg
+
+
+@pytest.mark.asyncio
 async def test_get_file_context_returns_none_when_no_match(backend, mock_pool):
     """When no file matches the suffix, return None (not raise).
     Matches Neo4j's `if not results: return None` at neo4j.py:500."""

@@ -532,8 +532,16 @@ class Neo4jReadBackend(ReadBackend):
             return None
         if len(results) > 1:
             examples = ", ".join(r.get("file_path") or "?" for r in results)
+            if repository:
+                hint = (
+                    "Provide a longer path suffix or entity_id= to disambiguate"
+                )
+            else:
+                hint = (
+                    "Provide repository= or a longer path suffix to disambiguate"
+                )
             raise ValueError(
-                f"File '{file_path}' is ambiguous for the current filters. Matching entries: {examples}"
+                f"File '{file_path}' is ambiguous — matches: {examples}. {hint}."
             )
         return results[0]
 

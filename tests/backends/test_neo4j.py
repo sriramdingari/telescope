@@ -2234,6 +2234,21 @@ class TestGetFileContext:
         with pytest.raises(ValueError, match="ambiguous"):
             await graph_client.get_file_context("config.py")
 
+    async def test_get_file_context_ambiguity_message_when_repo_provided(self, graph_client):
+        """Symmetric to the Postgres fix — Neo4j ambiguity message
+        must not suggest 'Provide repository=' when repo was provided."""
+        graph_client._query = AsyncMock(return_value=[
+            {"name": "tasks.py", "file_path": "src/a/tasks.py",
+             "repository": "repo", "language": "Python"},
+            {"name": "tasks.py", "file_path": "src/b/tasks.py",
+             "repository": "repo", "language": "Python"},
+        ])
+        with pytest.raises(ValueError) as excinfo:
+            await graph_client.get_file_context("tasks.py", repository="repo")
+        msg = str(excinfo.value)
+        assert "mbiguous" in msg
+        assert "Provide repository=" not in msg
+
 
 class TestGetHookUsage:
     """Tests for Neo4jReadBackend.get_hook_usage()."""

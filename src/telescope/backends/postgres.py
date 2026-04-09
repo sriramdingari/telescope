@@ -905,9 +905,17 @@ class PostgresReadBackend(ReadBackend):
             return None
         if len(rows) > 1:
             examples = ", ".join(r.get("file_path") or "?" for r in rows)
+            if repository:
+                hint = (
+                    "Provide a longer path suffix or entity_id= to disambiguate"
+                )
+            else:
+                hint = (
+                    "Provide repository= or a longer path suffix to disambiguate"
+                )
             raise ValueError(
                 f"Ambiguous file path {file_path!r} — matches multiple files: "
-                f"{examples}. Provide repository= or a longer path suffix to disambiguate."
+                f"{examples}. {hint}."
             )
         file_sym = dict(rows[0])
         file_repo = file_sym["repository"]

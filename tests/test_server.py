@@ -520,6 +520,37 @@ class TestFindSymbolsTool:
         assert call_kwargs["language"] == "Python"
         assert call_kwargs["stereotype"] == "test"
 
+    async def test_find_symbols_default_code_mode_none(self, mock_ctx, mock_graph):
+        """find_symbols should default to code_mode='none' and pass it
+        through to the backend so identifier lookups don't dump source."""
+        mock_graph.find_symbols.return_value = [
+            CodeEntity(
+                name="Foo",
+                file_path="Foo.java",
+                repository="repo",
+                entity_id="repo::Foo",
+                line_start=1,
+                line_end=100,
+                code=None,
+                signature="public class Foo",
+                entity_type="class",
+                language="Java",
+                modifiers=["public"],
+                content_hash="h",
+            ),
+        ]
+
+        result = await find_symbols(query="Foo", ctx=mock_ctx)
+
+        # The default code_mode must be passed through as 'none'.
+        call_kwargs = mock_graph.find_symbols.call_args.kwargs
+        assert call_kwargs["code_mode"] == "none", \
+            f"Expected default code_mode='none'; got {call_kwargs.get('code_mode')!r}"
+
+        # The returned dict must reflect code=None (the backend's response).
+        assert len(result) == 1
+        assert result[0]["code"] is None
+
 
 # =============================================================================
 # get_file_context

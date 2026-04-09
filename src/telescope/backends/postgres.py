@@ -465,6 +465,7 @@ class PostgresReadBackend(ReadBackend):
                 exact=True,
                 language=language,
                 stereotype=stereotype,
+                code_mode=code_mode,
             )
             # Fallback to fuzzy symbol search if exact returned nothing
             if not symbol_results:
@@ -477,12 +478,11 @@ class PostgresReadBackend(ReadBackend):
                     exact=False,
                     language=language,
                     stereotype=stereotype,
+                    code_mode=code_mode,
                 )
-            # Apply the same code_mode transformation to symbol results so
-            # the response contract is consistent across both result types.
-            # Without this, code_mode="none" would leak full source code
-            # for identifier queries.
-            self._apply_code_mode(symbol_results, code_mode)
+            # find_symbols(code_mode=code_mode) above has already applied the
+            # requested mode to symbol_results; no further transformation
+            # needed before merging.
 
             # Merge: exact (or fuzzy fallback) matches first, then vector hits, dedup by entity_id
             seen_ids = {e.entity_id for e in symbol_results}
@@ -506,6 +506,7 @@ class PostgresReadBackend(ReadBackend):
         exact: bool = False,
         language: str | None = None,
         stereotype: str | None = None,
+        code_mode: str = "none",
     ) -> list[CodeEntity]:
         pool = self._require_pool()
         conditions = []
@@ -544,7 +545,9 @@ class PostgresReadBackend(ReadBackend):
             f"SELECT * FROM code_symbols {where} LIMIT ${len(params)}",
             *params,
         )
-        return [self._row_to_code_entity(dict(r)) for r in rows]
+        entities = [self._row_to_code_entity(dict(r)) for r in rows]
+        self._apply_code_mode(entities, code_mode)
+        return entities
 
     # ── Call graph ───────────────────────────────────────────────────────
 

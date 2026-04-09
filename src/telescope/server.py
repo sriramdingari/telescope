@@ -522,6 +522,7 @@ async def find_symbols(
     stereotype: str | None = None,
     limit: int = 20,
     exact: bool = False,
+    code_mode: str = "none",
 ) -> list[dict]:
     """
     Find exact or substring symbol matches across the full Constellation graph.
@@ -529,6 +530,13 @@ async def find_symbols(
     Use this when you know the symbol or path fragment you want and need more than
     vector search can provide, including fields, packages, hooks, references, and files.
     You can also filter by language and stereotype.
+
+    Args:
+        code_mode: How much code to include in results (default "none"):
+            - "none": No code, just metadata (smallest response, default)
+            - "signature": Only method/class signature
+            - "preview": First 10 lines of code
+            - "full": Complete source code (use sparingly)
     """
     if entity_types:
         invalid = sorted(set(entity_types) - VALID_SYMBOL_ENTITY_TYPES)
@@ -537,6 +545,12 @@ async def find_symbols(
                 f"Invalid entity_types {invalid}. "
                 f"Valid values: {', '.join(sorted(VALID_SYMBOL_ENTITY_TYPES))}"
             )
+
+    # Validate code_mode (mirrors search_code's behavior of silently
+    # coercing invalid values to the default).
+    valid_modes = {"none", "signature", "preview", "full"}
+    if code_mode not in valid_modes:
+        code_mode = "none"
 
     graph = ctx.request_context.lifespan_context.graph
     results = await graph.find_symbols(
@@ -548,6 +562,7 @@ async def find_symbols(
         stereotype=stereotype,
         limit=min(limit, 50),
         exact=exact,
+        code_mode=code_mode,
     )
     return [
         _entity_to_dict(r)

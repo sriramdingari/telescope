@@ -464,6 +464,7 @@ class TestSearchCode:
             exact=True,
             language=None,
             stereotype=None,
+            code_mode="preview",
         )
         assert [result.name for result in results] == ["useState", "semantic"]
 
@@ -1944,6 +1945,35 @@ class TestFindSymbols:
         assert "CASE\n                         WHEN toLower(n.name) = toLower($search_query)" in cypher_arg
         assert kwargs["search_query"] == "helper"
         assert "query" not in kwargs
+
+    async def test_find_symbols_applies_code_mode_none_by_default(self, graph_client):
+        """find_symbols should default to code_mode='none' so identifier
+        lookups don't dump full source bodies unnecessarily."""
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "id": "repo::Foo",
+                "name": "Foo",
+                "file_path": "Foo.java",
+                "repository": "repo",
+                "line_number": 1,
+                "line_end": 100,
+                "signature": "public class Foo",
+                "code": "public class Foo { /* 100 lines */ }",
+                "entity_type": "Class",
+                "language": "Java",
+                "return_type": None,
+                "modifiers": ["public"],
+                "stereotypes": [],
+                "content_hash": "h",
+                "properties": {},
+            },
+        ])
+
+        results = await graph_client.find_symbols("Foo")
+
+        assert len(results) == 1
+        assert results[0].code is None, \
+            f"default code_mode should be 'none'; got code={results[0].code!r}"
 
 
 class TestGetFileContext:

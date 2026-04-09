@@ -1516,6 +1516,49 @@ async def test_find_symbols_matches_file_path_in_fuzzy_mode(backend, mock_pool):
 
 
 @pytest.mark.asyncio
+async def test_find_symbols_applies_code_mode_none_by_default(backend, mock_pool):
+    """find_symbols should default to code_mode='none' so identifier
+    lookups don't dump full source bodies unnecessarily."""
+    mock_pool.fetch = AsyncMock(return_value=[
+        {"id": "repo::Foo", "symbol_name": "Foo",
+         "symbol_type": "Class", "file_path": "Foo.java", "repository": "repo",
+         "line_start": 1, "line_end": 100,
+         "signature": "public class Foo",
+         "code": "public class Foo { /* 100 lines */ }",
+         "docstring": None, "language": "java",
+         "return_type": None, "modifiers": ["public"], "stereotypes": [],
+         "content_hash": "h", "properties": {}},
+    ])
+
+    result = await backend.find_symbols("Foo")
+
+    assert len(result) == 1
+    assert result[0].code is None, \
+        f"default code_mode should be 'none'; got code={result[0].code!r}"
+
+
+@pytest.mark.asyncio
+async def test_find_symbols_honors_code_mode_signature(backend, mock_pool):
+    """find_symbols(code_mode='signature') should replace code with
+    signature on each returned entity."""
+    mock_pool.fetch = AsyncMock(return_value=[
+        {"id": "repo::Foo", "symbol_name": "Foo",
+         "symbol_type": "Class", "file_path": "Foo.java", "repository": "repo",
+         "line_start": 1, "line_end": 100,
+         "signature": "public class Foo",
+         "code": "public class Foo { /* 100 lines */ }",
+         "docstring": None, "language": "java",
+         "return_type": None, "modifiers": ["public"], "stereotypes": [],
+         "content_hash": "h", "properties": {}},
+    ])
+
+    result = await backend.find_symbols("Foo", code_mode="signature")
+
+    assert len(result) == 1
+    assert result[0].code == "public class Foo"
+
+
+@pytest.mark.asyncio
 async def test_get_callers_sets_truncated_when_limit_exceeded(backend, mock_pool):
     """get_callers must set truncated=True on every returned node when
     more callers exist than the limit. Currently returns truncated=False

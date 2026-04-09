@@ -52,6 +52,7 @@ class ReadBackend(ABC):
         exact: bool = False,
         language: str | None = None,
         stereotype: str | None = None,
+        code_mode: str = "none",
     ) -> list[CodeEntity]: ...
 
     @abstractmethod

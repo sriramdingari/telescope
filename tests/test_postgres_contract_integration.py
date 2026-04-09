@@ -214,10 +214,15 @@ class TestPostgresContractTaskCoverage:
         not the root cause — the assertion itself was simply wrong for
         Java. This rewrite asks for a parser/language combination where
         Constellation actually populates code, which is the correct
-        target for this contract assertion."""
+        target for this contract assertion.
+
+        Plan B Task 3: find_symbols now defaults to code_mode='none' to
+        save tokens on identifier lookups. This contract test still
+        wants to verify the fixture populates raw code bodies, so it
+        explicitly requests code_mode='full' to bypass the default."""
         repository = seeded_postgres_contract_repository
         results = await pg_read_backend.find_symbols(
-            "App", repository=repository, exact=True,
+            "App", repository=repository, exact=True, code_mode="full",
         )
         # The fixture's App.tsx has multiple symbols matching "App"
         # (App component, App function, etc.). Pick whichever one has

@@ -448,6 +448,37 @@ class Neo4jReadBackend(ReadBackend):
             properties=self._custom_entity_properties(record.get("properties")),
         )
 
+    @staticmethod
+    def _apply_code_mode(entities: list[CodeEntity], code_mode: str) -> None:
+        """Mutate entities to reflect the requested code_mode.
+
+        Mirrors the postgres.py:367-395 helper contract, but preserves
+        Neo4j's pre-existing preview behavior:
+
+        - "none": zero out the code field
+        - "signature": replace code with the signature
+        - "preview": if code is empty/None, fall back to signature;
+          otherwise keep the first 10 lines (splitting on "\\n") and
+          append "\\n... (truncated)" when the original has more than
+          10 lines
+        - anything else (e.g. "full"): leave code unchanged
+        """
+        if code_mode == "none":
+            for e in entities:
+                e.code = None
+        elif code_mode == "signature":
+            for e in entities:
+                e.code = e.signature
+        elif code_mode == "preview":
+            for e in entities:
+                if not e.code:
+                    e.code = e.signature
+                    continue
+                lines = e.code.split("\n")
+                if len(lines) <= 10:
+                    continue
+                e.code = "\n".join(lines[:10]) + "\n... (truncated)"
+
     def _method_family_fragment(self, alias: str) -> str:
         """Build a method-family expansion based on class/interface relationships."""
         return f"""
@@ -549,25 +580,10 @@ class Neo4jReadBackend(ReadBackend):
         all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
         results = all_results[:limit]
 
-        def process_code(code: str | None, signature: str | None) -> str | None:
-            if code_mode == "none":
-                return None
-            if code_mode == "signature":
-                return signature
-            if code_mode == "preview":
-                if not code:
-                    return signature
-                lines = code.split("\n")
-                if len(lines) <= 10:
-                    return code
-                return "\n".join(lines[:10]) + "\n... (truncated)"
-            return code
-
-        entities: list[CodeEntity] = []
-        for record in results:
-            entity = self._entity_from_record(record)
-            entity.code = process_code(record.get("code"), record.get("signature"))
-            entities.append(entity)
+        entities: list[CodeEntity] = [
+            self._entity_from_record(record) for record in results
+        ]
+        self._apply_code_mode(entities, code_mode)
 
         if self._looks_like_symbol_query(query):
             symbol_results = await self.find_symbols(
@@ -579,6 +595,7 @@ class Neo4jReadBackend(ReadBackend):
                 exact=True,
                 language=language,
                 stereotype=stereotype,
+                code_mode=code_mode,
             )
             if not symbol_results:
                 symbol_results = await self.find_symbols(
@@ -590,12 +607,15 @@ class Neo4jReadBackend(ReadBackend):
                     exact=False,
                     language=language,
                     stereotype=stereotype,
+                    code_mode=code_mode,
                 )
+            # find_symbols(code_mode=code_mode) above has already applied the
+            # requested mode to symbol_results; no further transformation
+            # needed before merging.
 
             merged: list[CodeEntity] = []
             seen: set[tuple[str | None, str, str, str]] = set()
             for entity in symbol_results + entities:
-                entity.code = process_code(entity.code, entity.signature)
                 key = (
                     entity.entity_id,
                     entity.entity_type,
@@ -1149,6 +1169,7 @@ class Neo4jReadBackend(ReadBackend):
         exact: bool = False,
         language: str | None = None,
         stereotype: str | None = None,
+        code_mode: str = "none",
     ) -> list[CodeEntity]:
         """Find graph entities by exact or substring symbol match."""
         limit = self._clamp_result_limit(limit, maximum=50)
@@ -1196,7 +1217,9 @@ class Neo4jReadBackend(ReadBackend):
             limit=limit,
             **filter_params,
         )
-        return [self._entity_from_record(row) for row in results]
+        entities = [self._entity_from_record(row) for row in results]
+        self._apply_code_mode(entities, code_mode)
+        return entities
 
     async def get_file_context(
         self,

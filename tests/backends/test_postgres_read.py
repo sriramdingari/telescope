@@ -1279,6 +1279,45 @@ async def test_get_impact_accepts_entity_id(backend, mock_pool):
 
 
 @pytest.mark.asyncio
+async def test_get_function_context_reuses_resolved_id_for_inner_calls(backend, mock_pool):
+    """Closes the latent ambiguity-resolver gap that the entity_id input
+    path would otherwise expose: once the outer _resolve_symbol has
+    uniquely identified the target, the inner get_callers/get_callees
+    calls must use the resolved entity_id rather than re-entering the
+    name branch (which can raise ValueError on genuinely ambiguous
+    names like 'process' across unrelated classes). Mirrors the Neo4j
+    parity at tests/backends/test_neo4j.py around the equivalent
+    get_function_context with_filters test."""
+    async def fake_resolve(*args, **kwargs):
+        return {
+            "id": "my-repo::com.example.Service.doIt",
+            "symbol_name": "doIt",
+            "file_path": "src/Service.java",
+            "repository": "my-repo",
+            "code": "void doIt() {}",
+            "signature": "void doIt()",
+            "docstring": None,
+        }
+    backend._resolve_symbol = fake_resolve
+    mock_pool.fetchrow = AsyncMock(return_value=None)  # no owning class lookup
+    backend.get_callers = AsyncMock(return_value=[])
+    backend.get_callees = AsyncMock(return_value=[])
+
+    await backend.get_function_context("doIt")
+
+    assert backend.get_callers.call_args.kwargs["entity_id"] == \
+        "my-repo::com.example.Service.doIt", (
+        f"Inner get_callers must receive the resolved entity_id; "
+        f"got: {backend.get_callers.call_args.kwargs}"
+    )
+    assert backend.get_callees.call_args.kwargs["entity_id"] == \
+        "my-repo::com.example.Service.doIt", (
+        f"Inner get_callees must receive the resolved entity_id; "
+        f"got: {backend.get_callees.call_args.kwargs}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_get_function_context_handles_missing_owning_class(backend, mock_pool):
     """A top-level function (no owning class) should get class_name=None."""
     async def fake_resolve(*args, **kwargs):

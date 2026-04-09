@@ -1084,7 +1084,7 @@ class Neo4jReadBackend(ReadBackend):
         top_classes_cypher = f"""
             MATCH (c:Class)
             {top_classes_filter} NOT (c)-[:EXTENDS]->(:Class)
-              AND NOT c.is_test
+              AND NOT 'test' IN coalesce(c.stereotypes, [])
             OPTIONAL MATCH (child:Class)-[:EXTENDS*]->(c)
             WITH c, count(child) AS descendants
             ORDER BY descendants DESC
@@ -1098,7 +1098,7 @@ class Neo4jReadBackend(ReadBackend):
         entry_points_cypher = f"""
             MATCH (m:Method)
             {entry_filter} ('endpoint' IN m.stereotypes OR m.name = 'main')
-              AND NOT m.is_test
+              AND NOT 'test' IN coalesce(m.stereotypes, [])
             OPTIONAL MATCH (c:Class)-[:HAS_METHOD]->(m)
             RETURN m.name AS name, c.name AS class_name
             LIMIT 10

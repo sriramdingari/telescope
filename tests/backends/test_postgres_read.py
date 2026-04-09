@@ -873,8 +873,13 @@ async def test_get_codebase_overview_reconstructs_nested_dotnet_namespaces(
 
 @pytest.mark.asyncio
 async def test_get_codebase_overview_excludes_test_entities(backend, mock_pool):
-    """top_level_classes and entry_points must exclude is_test=true
-    rows so the overview surfaces production code, not test fixtures.
+    """top_level_classes and entry_points must exclude test rows via a
+    null-safe filter (`is_test IS NOT TRUE`) so the overview surfaces
+    production code, not test fixtures.
+
+    The `IS NOT TRUE` form admits both `false` and `NULL`, whereas
+    `is_test = false` silently drops NULL rows. Covers both
+    with-repository and without-repository branches.
     """
     counts: list = []
     langs: list = []
@@ -891,7 +896,11 @@ async def test_get_codebase_overview_excludes_test_entities(backend, mock_pool):
 
     captured_sqls: list[str] = []
     call_count = {"n": 0}
-    fetch_sequence = [counts, langs, entry_points_rows, top_classes_rows, export_count]
+    # The overview issues the same fetch sequence twice (once per call).
+    fetch_sequence = [
+        counts, langs, entry_points_rows, top_classes_rows, export_count,
+        counts, langs, entry_points_rows, top_classes_rows, export_count,
+    ]
 
     async def fetch_side_effect(sql, *args, **kwargs):
         captured_sqls.append(sql)
@@ -900,7 +909,8 @@ async def test_get_codebase_overview_excludes_test_entities(backend, mock_pool):
         return fetch_sequence[idx] if idx < len(fetch_sequence) else []
     mock_pool.fetch = AsyncMock(side_effect=fetch_side_effect)
 
-    result = await backend.get_codebase_overview(repository="repo")
+    # --- with-repository branch ---
+    await backend.get_codebase_overview(repository="repo")
 
     # Find the entry_points and top_classes SQLs
     ep_sqls = [s for s in captured_sqls if "endpoint" in s and "stereotypes" in s]
@@ -910,11 +920,57 @@ async def test_get_codebase_overview_excludes_test_entities(backend, mock_pool):
     assert ep_sqls, f"Expected entry_points query; got: {captured_sqls}"
     assert tc_sqls, f"Expected top_classes query; got: {captured_sqls}"
 
-    assert "is_test = false" in ep_sqls[0] or "NOT is_test" in ep_sqls[0], (
-        f"entry_points query must exclude is_test; got: {ep_sqls[0]}"
+    assert "is_test IS NOT TRUE" in ep_sqls[0], (
+        f"entry_points query must use null-safe `is_test IS NOT TRUE` "
+        f"filter; got: {ep_sqls[0]}"
     )
-    assert "is_test = false" in tc_sqls[0] or "NOT is_test" in tc_sqls[0], (
-        f"top_classes query must exclude is_test; got: {tc_sqls[0]}"
+    assert "is_test IS NOT TRUE" in tc_sqls[0], (
+        f"top_classes query must use null-safe `is_test IS NOT TRUE` "
+        f"filter; got: {tc_sqls[0]}"
+    )
+    # Reject the old brittle form
+    assert "is_test = false" not in ep_sqls[0], (
+        f"entry_points query must NOT use brittle `is_test = false` "
+        f"(drops NULL rows); got: {ep_sqls[0]}"
+    )
+    assert "is_test = false" not in tc_sqls[0], (
+        f"top_classes query must NOT use brittle `is_test = false` "
+        f"(drops NULL rows); got: {tc_sqls[0]}"
+    )
+
+    # --- without-repository branch ---
+    # The `else` arms of both queries in postgres.py are distinct string
+    # literals from the with-repository arms, so they need independent
+    # coverage.
+    captured_sqls.clear()
+    call_count["n"] = 5  # continue consuming the second half of fetch_sequence
+    await backend.get_codebase_overview()  # no repository
+
+    ep_sqls_no_repo = [s for s in captured_sqls if "endpoint" in s and "stereotypes" in s]
+    tc_sqls_no_repo = [s for s in captured_sqls
+                       if "NOT IN" in s and "EXTENDS" in s]
+
+    assert ep_sqls_no_repo, (
+        f"Expected entry_points query in no-repo branch; got: {captured_sqls}"
+    )
+    assert tc_sqls_no_repo, (
+        f"Expected top_classes query in no-repo branch; got: {captured_sqls}"
+    )
+    assert "is_test IS NOT TRUE" in ep_sqls_no_repo[0], (
+        f"entry_points query (no-repo branch) must use null-safe "
+        f"`is_test IS NOT TRUE` filter; got: {ep_sqls_no_repo[0]}"
+    )
+    assert "is_test IS NOT TRUE" in tc_sqls_no_repo[0], (
+        f"top_classes query (no-repo branch) must use null-safe "
+        f"`is_test IS NOT TRUE` filter; got: {tc_sqls_no_repo[0]}"
+    )
+    assert "is_test = false" not in ep_sqls_no_repo[0], (
+        f"entry_points query (no-repo branch) must NOT use brittle "
+        f"`is_test = false`; got: {ep_sqls_no_repo[0]}"
+    )
+    assert "is_test = false" not in tc_sqls_no_repo[0], (
+        f"top_classes query (no-repo branch) must NOT use brittle "
+        f"`is_test = false`; got: {tc_sqls_no_repo[0]}"
     )
 
 

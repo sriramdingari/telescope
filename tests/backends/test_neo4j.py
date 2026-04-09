@@ -1490,29 +1490,105 @@ class TestGetCodebaseOverview:
         assert result.entry_points == ["ApiController.handleRequest", "main"]
 
     async def test_get_codebase_overview_excludes_test_entities(self, graph_client):
-        """top_level_classes and entry_points must exclude is_test=true
-        rows via a Cypher filter, symmetric to the Postgres fix."""
+        """top_level_classes and entry_points must exclude nodes whose
+        stereotypes contain 'test', via a null-safe Cypher idiom.
+
+        Constellation never writes `is_test` as a Neo4j property — it
+        only writes `stereotypes`. So the filter MUST use
+        `'test' IN coalesce(x.stereotypes, [])`, NOT `x.is_test`.
+        Otherwise `NOT null = null` (falsy) filters out every row.
+        Covers both with-repository and without-repository branches.
+        """
+        # Shared stub overview row
+        overview_row = {
+            "files": 10, "classes": 5, "interfaces": 2,
+            "methods": 20, "constructors": 3, "fields": 6,
+            "packages_count": 2, "hooks": 0, "references": 1,
+            "exports": 4, "languages": ["Python"],
+        }
+
+        # --- with-repository branch ---
         graph_client._query = AsyncMock(side_effect=[
-            [{
-                "files": 10, "classes": 5, "interfaces": 2,
-                "methods": 20, "constructors": 3, "fields": 6,
-                "packages_count": 2, "hooks": 0, "references": 1,
-                "exports": 4, "languages": ["Python"],
-            }],
+            [overview_row],
             [],  # top classes
             [],  # entry points
         ])
-
         await graph_client.get_codebase_overview(repository="repo")
 
         top_classes_cypher = graph_client._query.call_args_list[1][0][0]
-        assert "NOT c.is_test" in top_classes_cypher or "is_test = false" in top_classes_cypher, (
-            f"Neo4j top_classes Cypher must exclude is_test; got: {top_classes_cypher}"
+        entry_points_cypher = graph_client._query.call_args_list[2][0][0]
+
+        # top_classes filter: null-safe stereotype-array idiom, negated.
+        assert (
+            "'test' IN coalesce(c.stereotypes, [])" in top_classes_cypher
+            or "'test' IN COALESCE(c.stereotypes, [])" in top_classes_cypher
+        ), (
+            f"top_classes Cypher must use the null-safe test-stereotype "
+            f"filter idiom; got: {top_classes_cypher}"
+        )
+        assert "NOT 'test' IN" in top_classes_cypher, (
+            f"top_classes filter must be negated (NOT ...); "
+            f"got: {top_classes_cypher}"
+        )
+        # Reject the old broken form
+        assert "NOT c.is_test" not in top_classes_cypher, (
+            f"top_classes must NOT use the broken `NOT c.is_test` filter "
+            f"(is_test is never written as a Neo4j property); "
+            f"got: {top_classes_cypher}"
         )
 
-        entry_points_cypher = graph_client._query.call_args_list[2][0][0]
-        assert "NOT m.is_test" in entry_points_cypher or "is_test = false" in entry_points_cypher, (
-            f"Neo4j entry_points Cypher must exclude is_test; got: {entry_points_cypher}"
+        # entry_points filter: same idiom on Method nodes.
+        assert (
+            "'test' IN coalesce(m.stereotypes, [])" in entry_points_cypher
+            or "'test' IN COALESCE(m.stereotypes, [])" in entry_points_cypher
+        ), (
+            f"entry_points Cypher must use the null-safe test-stereotype "
+            f"filter idiom; got: {entry_points_cypher}"
+        )
+        assert "NOT 'test' IN" in entry_points_cypher, (
+            f"entry_points filter must be negated (NOT ...); "
+            f"got: {entry_points_cypher}"
+        )
+        assert "NOT m.is_test" not in entry_points_cypher, (
+            f"entry_points must NOT use the broken `NOT m.is_test` filter; "
+            f"got: {entry_points_cypher}"
+        )
+
+        # --- without-repository branch ---
+        # The Cypher templates differ between with-repo and without-repo
+        # (top_classes_filter / entry_filter variables), so the filter must
+        # be present in both.
+        graph_client._query = AsyncMock(side_effect=[
+            [overview_row],
+            [],  # top classes
+            [],  # entry points
+        ])
+        await graph_client.get_codebase_overview()  # no repository
+
+        top_classes_cypher_no_repo = graph_client._query.call_args_list[1][0][0]
+        entry_points_cypher_no_repo = graph_client._query.call_args_list[2][0][0]
+
+        assert (
+            "'test' IN coalesce(c.stereotypes, [])" in top_classes_cypher_no_repo
+            or "'test' IN COALESCE(c.stereotypes, [])" in top_classes_cypher_no_repo
+        ), (
+            f"top_classes Cypher (no-repo branch) must use the null-safe "
+            f"test-stereotype filter idiom; got: {top_classes_cypher_no_repo}"
+        )
+        assert "NOT 'test' IN" in top_classes_cypher_no_repo, (
+            f"top_classes filter (no-repo branch) must be negated; "
+            f"got: {top_classes_cypher_no_repo}"
+        )
+        assert (
+            "'test' IN coalesce(m.stereotypes, [])" in entry_points_cypher_no_repo
+            or "'test' IN COALESCE(m.stereotypes, [])" in entry_points_cypher_no_repo
+        ), (
+            f"entry_points Cypher (no-repo branch) must use the null-safe "
+            f"test-stereotype filter idiom; got: {entry_points_cypher_no_repo}"
+        )
+        assert "NOT 'test' IN" in entry_points_cypher_no_repo, (
+            f"entry_points filter (no-repo branch) must be negated; "
+            f"got: {entry_points_cypher_no_repo}"
         )
 
     async def test_get_codebase_overview_empty_results(self, graph_client):

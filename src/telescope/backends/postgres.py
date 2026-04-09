@@ -1230,7 +1230,7 @@ class PostgresReadBackend(ReadBackend):
                 SELECT symbol_name, file_path FROM code_symbols
                 WHERE repository = $1
                   AND ('endpoint' = ANY(stereotypes) OR symbol_name = 'main')
-                  AND is_test = false
+                  AND is_test IS NOT TRUE
                 LIMIT 20
             """
             entry_points = await pool.fetch(ep_query, repository)
@@ -1238,7 +1238,7 @@ class PostgresReadBackend(ReadBackend):
             entry_points = await pool.fetch("""
                 SELECT symbol_name, file_path FROM code_symbols
                 WHERE ('endpoint' = ANY(stereotypes) OR symbol_name = 'main')
-                  AND is_test = false
+                  AND is_test IS NOT TRUE
                 LIMIT 20
             """)
 
@@ -1247,7 +1247,7 @@ class PostgresReadBackend(ReadBackend):
                 SELECT s.symbol_name FROM code_symbols s
                 WHERE s.symbol_type = 'Class'
                   AND s.repository = $1
-                  AND s.is_test = false
+                  AND s.is_test IS NOT TRUE
                   AND s.id NOT IN (
                       SELECT source_symbol_id FROM code_references WHERE ref_type = 'EXTENDS'
                   )
@@ -1259,7 +1259,7 @@ class PostgresReadBackend(ReadBackend):
             top_classes = await pool.fetch("""
                 SELECT s.symbol_name FROM code_symbols s
                 WHERE s.symbol_type = 'Class'
-                  AND s.is_test = false
+                  AND s.is_test IS NOT TRUE
                   AND s.id NOT IN (
                       SELECT source_symbol_id FROM code_references WHERE ref_type = 'EXTENDS'
                   )

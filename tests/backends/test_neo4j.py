@@ -1975,6 +1975,46 @@ class TestFindSymbols:
         assert results[0].code is None, \
             f"default code_mode should be 'none'; got code={results[0].code!r}"
 
+    async def test_find_symbols_honors_code_mode_preview(self, graph_client):
+        """find_symbols(code_mode='preview') should return at most 10 lines
+        with a truncation marker. Neo4j's _apply_code_mode helper appends
+        '\\n... (truncated)' when the source has more than 10 lines. This
+        test is a direct regression guard against any future bypass of
+        _apply_code_mode in find_symbols (currently the preview branch is
+        only indirectly covered by search_code tests)."""
+        long_code = "\n".join(f"line{i}" for i in range(20))  # 20 lines
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "id": "repo::Foo",
+                "name": "Foo",
+                "file_path": "Foo.java",
+                "repository": "repo",
+                "line_number": 1,
+                "line_end": 20,
+                "signature": "public class Foo",
+                "code": long_code,
+                "entity_type": "Class",
+                "language": "Java",
+                "return_type": None,
+                "modifiers": ["public"],
+                "stereotypes": [],
+                "content_hash": "h",
+                "properties": {},
+            },
+        ])
+
+        results = await graph_client.find_symbols("Foo", code_mode="preview")
+
+        assert len(results) == 1
+        code = results[0].code
+        assert code is not None
+        assert "line0" in code
+        assert "line9" in code
+        assert "line10" not in code, \
+            f"Preview should drop line 10 and later; got: {code!r}"
+        assert "... (truncated)" in code, \
+            f"Preview should append truncation marker; got: {code!r}"
+
 
 class TestGetFileContext:
     """Tests for Neo4jReadBackend.get_file_context()."""

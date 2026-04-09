@@ -135,6 +135,20 @@ Exact/substring graph lookup across all persisted entity types, including files,
 find_symbols("useState", entity_types=["hook"], repository="my-app")
 ```
 
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query` | string | required | Identifier or path fragment to look up |
+| `entity_types` | list[string] | — | Filter by entity type (e.g. `"hook"`, `"class"`, `"method"`, `"field"`, `"file"`, `"package"`, `"reference"`) |
+| `repository` | string | — | Filter by repository name |
+| `file_pattern` | string | — | Filter by file path pattern |
+| `language` | string | — | Filter by persisted language |
+| `stereotype` | string | — | Filter by persisted stereotype |
+| `limit` | int | 20 | Max results (capped at 50) |
+| `exact` | bool | `false` | When true, match the identifier exactly; otherwise substring match |
+| `code_mode` | string | `"none"` | `"none"`, `"signature"`, `"preview"` (10 lines), `"full"` |
+
+Unlike `search_code`, `find_symbols` is the identifier-lookup tool, so `code_mode` defaults to `"none"` to keep responses small; agents that need code bodies should pass `"signature"`, `"preview"`, or `"full"` explicitly.
+
 ### get_repository_context
 
 Get one repository's source metadata plus aggregate graph statistics.

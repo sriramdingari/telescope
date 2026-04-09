@@ -522,7 +522,15 @@ class TestFindSymbolsTool:
 
     async def test_find_symbols_default_code_mode_none(self, mock_ctx, mock_graph):
         """find_symbols should default to code_mode='none' and pass it
-        through to the backend so identifier lookups don't dump source."""
+        through to the backend so identifier lookups don't dump source.
+
+        Note: the backend is fully mocked (mock_graph.find_symbols is an
+        AsyncMock), so the server never invokes the real backend's
+        _apply_code_mode helper. The only diagnostic assertion here is
+        that the server passes the default 'none' through to the backend
+        in kwargs. Asserting on the returned dict's 'code' field would
+        merely echo whatever the fixture carries and add no coverage.
+        """
         mock_graph.find_symbols.return_value = [
             CodeEntity(
                 name="Foo",
@@ -540,16 +548,25 @@ class TestFindSymbolsTool:
             ),
         ]
 
-        result = await find_symbols(query="Foo", ctx=mock_ctx)
+        await find_symbols(query="Foo", ctx=mock_ctx)
 
         # The default code_mode must be passed through as 'none'.
         call_kwargs = mock_graph.find_symbols.call_args.kwargs
         assert call_kwargs["code_mode"] == "none", \
             f"Expected default code_mode='none'; got {call_kwargs.get('code_mode')!r}"
 
-        # The returned dict must reflect code=None (the backend's response).
-        assert len(result) == 1
-        assert result[0]["code"] is None
+    async def test_find_symbols_invalid_code_mode_defaults_to_none(
+        self, mock_ctx, mock_graph
+    ):
+        """Invalid code_mode falls back to 'none' for find_symbols.
+
+        Mirrors TestSearchCodeTool.test_invalid_code_mode_defaults_to_preview
+        but asserts find_symbols' default ('none') per server.py:551-553.
+        """
+        mock_graph.find_symbols.return_value = []
+        await find_symbols(query="test", code_mode="bogus_value", ctx=mock_ctx)
+        call_kwargs = mock_graph.find_symbols.call_args.kwargs
+        assert call_kwargs["code_mode"] == "none"
 
 
 # =============================================================================

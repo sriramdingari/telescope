@@ -14,6 +14,20 @@ class Config:
     openai_base_url: str | None = None
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
+    storage_backend: str = "neo4j"
+    postgres_dsn: str = ""
+
+    def __post_init__(self) -> None:
+        """Validate that postgres_dsn is set when storage_backend is postgres.
+
+        Fails fast at config construction instead of deferring to an opaque
+        asyncpg connection error when the factory tries to dial an empty DSN.
+        """
+        if self.storage_backend == "postgres" and not self.postgres_dsn:
+            raise ValueError(
+                "storage_backend='postgres' requires postgres_dsn to be set. "
+                "Example: postgresql://user:pass@host:5432/dbname"
+            )
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -26,6 +40,8 @@ class Config:
             openai_base_url=os.environ.get("OPENAI_BASE_URL") or None,
             embedding_model=os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small"),
             embedding_dimensions=int(os.environ.get("EMBEDDING_DIMENSIONS", "1536")),
+            storage_backend=os.environ.get("STORAGE_BACKEND", "neo4j"),
+            postgres_dsn=os.environ.get("POSTGRES_DSN", ""),
         )
 
 

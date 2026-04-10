@@ -10,14 +10,19 @@ Telescope is the query layer for Constellation. Constellation indexes codebases 
 graph LR
     A[Claude Code / AI Assistant] -->|MCP Protocol| B[Telescope]
     B -->|Cypher Queries| C[(Neo4j)]
+    B -->|SQL + pgvector| F[(Postgres)]
     B -->|Embedding API| D[OpenAI / LiteLLM]
     E[Constellation] -->|Indexes code into| C
+    E -->|Indexes code into| F
 
     style B fill:#009688,color:#fff
     style C fill:#4C8BF5,color:#fff
+    style F fill:#336791,color:#fff
     style D fill:#412991,color:#fff
     style E fill:#F57C00,color:#fff
 ```
+
+Telescope speaks to whichever backend Constellation indexed into. Both backends implement the identical 13-tool MCP contract — switch between them with a single environment variable (`STORAGE_BACKEND`).
 
 ## Installation
 
@@ -40,6 +45,17 @@ pip install .
 ```bash
 uvx --from git+https://github.com/sriramdingari/telescope.git telescope
 ```
+
+### Postgres Backend (Optional)
+
+By default, Telescope reads from Neo4j. To use a PostgreSQL + pgvector backend instead (e.g. if your Constellation instance is indexing into Postgres), set two environment variables:
+
+```bash
+export STORAGE_BACKEND=postgres
+export POSTGRES_DSN=postgresql://constellation:secret@localhost:5432/constellation
+```
+
+`asyncpg` and `pgvector` are shipped as default dependencies, so no extra install step is needed. The Postgres backend implements the same MCP tool contract as the Neo4j backend — all 13 tools (`search_code`, `get_callers`, `get_impact`, etc.) work identically.
 
 ## Setup with Claude Code
 
@@ -78,9 +94,11 @@ claude mcp add-json telescope --scope user '{
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection URI |
+| `STORAGE_BACKEND` | `neo4j` | `neo4j` or `postgres` — which backend Telescope reads from |
+| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection URI (when `STORAGE_BACKEND=neo4j`) |
 | `NEO4J_USER` | `neo4j` | Neo4j username |
 | `NEO4J_PASSWORD` | `constellation` | Neo4j password |
+| `POSTGRES_DSN` | — | Postgres + pgvector DSN (required when `STORAGE_BACKEND=postgres`) |
 | `OPENAI_API_KEY` | — | API key for embedding generation |
 | `OPENAI_BASE_URL` | — | Custom base URL (e.g., LiteLLM proxy) |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model name |
@@ -116,6 +134,20 @@ Exact/substring graph lookup across all persisted entity types, including files,
 ```
 find_symbols("useState", entity_types=["hook"], repository="my-app")
 ```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query` | string | required | Identifier or path fragment to look up |
+| `entity_types` | list[string] | — | Filter by entity type (e.g. `"hook"`, `"class"`, `"method"`, `"field"`, `"file"`, `"package"`, `"reference"`) |
+| `repository` | string | — | Filter by repository name |
+| `file_pattern` | string | — | Filter by file path pattern |
+| `language` | string | — | Filter by persisted language |
+| `stereotype` | string | — | Filter by persisted stereotype |
+| `limit` | int | 20 | Max results (capped at 50) |
+| `exact` | bool | `false` | When true, match the identifier exactly; otherwise substring match |
+| `code_mode` | string | `"none"` | `"none"`, `"signature"`, `"preview"` (10 lines), `"full"` |
+
+Unlike `search_code`, `find_symbols` is the identifier-lookup tool, so `code_mode` defaults to `"none"` to keep responses small; agents that need code bodies should pass `"signature"`, `"preview"`, or `"full"` explicitly.
 
 ### get_repository_context
 
@@ -254,28 +286,41 @@ python -m pytest -v
 
 ### Live Contract Tests
 
-Telescope includes an opt-in integration suite that seeds Neo4j with real parser output from Constellation and verifies the query contract end to end.
+Telescope ships **two** opt-in contract suites that seed each backend with real Constellation parser output (via the production normalization pipeline) and verify the read contract end-to-end. Both suites parse the same fixture repo (Java + JS/TS + C# nested namespace) using Constellation's actual parsers, so a regression in either backend's read path or in Constellation's parser shape surfaces immediately.
 
-Requirements:
+**Shared requirement** — a working Constellation checkout with parser deps installed:
 
-- local Neo4j reachable through `NEO4J_URI`-style settings
-- a working Constellation checkout with its parser dependencies installed
+- `CONSTELLATION_ROOT=/path/to/Constellation` (the conftest has a developer-machine default; set this env var on any other host)
+- `CONSTELLATION_PYTHON` (optional) — Python executable inside Constellation's venv (defaults to `$CONSTELLATION_ROOT/.venv/bin/python`)
 
-Environment:
+Without Constellation reachable, both suites skip cleanly with an actionable message.
 
-- `TELESCOPE_RUN_INTEGRATION=1` enables the live tests
-- `CONSTELLATION_ROOT` points at the Constellation checkout
-- `CONSTELLATION_PYTHON` optionally points at the Python executable inside Constellation's environment
-- `TELESCOPE_TEST_NEO4J_URI`, `TELESCOPE_TEST_NEO4J_USER`, and `TELESCOPE_TEST_NEO4J_PASSWORD` override the default local Neo4j settings
+#### Neo4j contract suite (`tests/test_contract_integration.py`)
 
-Example:
+Gated by the `integration` pytest marker. Requires a running Neo4j and `TELESCOPE_RUN_INTEGRATION=1`.
 
 ```bash
 TELESCOPE_RUN_INTEGRATION=1 \
 CONSTELLATION_ROOT=/path/to/Constellation \
-CONSTELLATION_PYTHON=/path/to/Constellation/.venv/bin/python \
+TELESCOPE_TEST_NEO4J_URI=bolt://localhost:7687 \
+TELESCOPE_TEST_NEO4J_PASSWORD=password \
 python -m pytest -v -m integration
 ```
+
+Override defaults via `TELESCOPE_TEST_NEO4J_URI`, `TELESCOPE_TEST_NEO4J_USER`, `TELESCOPE_TEST_NEO4J_PASSWORD`.
+
+#### Postgres contract suite (`tests/test_postgres_contract_integration.py`)
+
+Gated by the `postgres_integration` pytest marker. Runs **by default** in any normal `pytest` invocation when Docker is available — `testcontainers[postgres]` spins up a `pgvector/pgvector:pg16` container for the session, Constellation seeds it through its real `PostgresWriteBackend`, and the suite tears it all down at the end.
+
+```bash
+# Runs automatically with Docker available — no env vars needed:
+python -m pytest -v tests/test_postgres_contract_integration.py
+```
+
+Without Docker, the suite skips gracefully via the testcontainers fixture.
+
+Both suites validate the same parity contracts: file/package/class/constructor/field/reference/hook/call-graph queries, code-mode handling, overload disambiguation, and nested .NET namespace reconstruction (`Company.Product.Services` should never leak the leaf-only `Services` from any query).
 
 ## License
 

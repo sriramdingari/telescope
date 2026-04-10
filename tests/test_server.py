@@ -141,6 +141,7 @@ class TestGetCallersTool:
                 entity_type="method",
                 relationship_type="CALLS",
                 truncated=True,
+                entity_id="my-repo::handler.handle_request",
             ),
         ]
         result = await get_callers(method_name="process", ctx=mock_ctx)
@@ -155,6 +156,7 @@ class TestGetCallersTool:
             "entity_type": "method",
             "relationship_type": "CALLS",
             "truncated": True,
+            "entity_id": "my-repo::handler.handle_request",
         }
 
     async def test_passes_limit_through_to_graph(self, mock_ctx, mock_graph):
@@ -162,6 +164,32 @@ class TestGetCallersTool:
         await get_callers(method_name="foo", limit=80, ctx=mock_ctx)
         call_kwargs = mock_graph.get_callers.call_args.kwargs
         assert call_kwargs["limit"] == 80
+
+    async def test_get_callers_accepts_entity_id_for_chaining(self, mock_ctx, mock_graph):
+        """MCP tool must accept entity_id as an input parameter and pass it
+        through to the backend, enabling handle-first chained traversal from
+        a prior tool result's entity_id field."""
+        mock_graph.get_callers.return_value = []
+        await get_callers(
+            method_name="ignored",
+            entity_id="repo::Target.method",
+            ctx=mock_ctx,
+        )
+        call_kwargs = mock_graph.get_callers.call_args.kwargs
+        assert call_kwargs["entity_id"] == "repo::Target.method"
+
+    async def test_get_callers_with_entity_id_only(self, mock_ctx, mock_graph):
+        """Callers must be able to use entity_id without method_name."""
+        mock_graph.get_callers.return_value = []
+        await get_callers(entity_id="repo::Target.method", ctx=mock_ctx)
+        call_kwargs = mock_graph.get_callers.call_args.kwargs
+        assert call_kwargs["entity_id"] == "repo::Target.method"
+        assert call_kwargs["method_name"] is None
+
+    async def test_get_callers_raises_when_no_method_name_or_entity_id(self, mock_ctx, mock_graph):
+        """Must raise ValueError when neither method_name nor entity_id is provided."""
+        with pytest.raises(ValueError, match="method_name or entity_id"):
+            await get_callers(ctx=mock_ctx)
 
 
 # =============================================================================
@@ -190,6 +218,7 @@ class TestGetCalleesTool:
                 entity_type="reference",
                 relationship_type="CALLS",
                 truncated=True,
+                entity_id="my-repo::db.query_db",
             ),
         ]
         result = await get_callees(method_name="process", ctx=mock_ctx)
@@ -204,6 +233,7 @@ class TestGetCalleesTool:
             "entity_type": "reference",
             "relationship_type": "CALLS",
             "truncated": True,
+            "entity_id": "my-repo::db.query_db",
         }
 
     async def test_passes_limit_through_to_graph(self, mock_ctx, mock_graph):
@@ -211,6 +241,32 @@ class TestGetCalleesTool:
         await get_callees(method_name="foo", limit=80, ctx=mock_ctx)
         call_kwargs = mock_graph.get_callees.call_args.kwargs
         assert call_kwargs["limit"] == 80
+
+    async def test_get_callees_accepts_entity_id_for_chaining(self, mock_ctx, mock_graph):
+        """MCP tool must accept entity_id as an input parameter and pass it
+        through to the backend, enabling handle-first chained traversal from
+        a prior tool result's entity_id field."""
+        mock_graph.get_callees.return_value = []
+        await get_callees(
+            method_name="ignored",
+            entity_id="repo::Target.method",
+            ctx=mock_ctx,
+        )
+        call_kwargs = mock_graph.get_callees.call_args.kwargs
+        assert call_kwargs["entity_id"] == "repo::Target.method"
+
+    async def test_get_callees_with_entity_id_only(self, mock_ctx, mock_graph):
+        """Callees must be able to use entity_id without method_name."""
+        mock_graph.get_callees.return_value = []
+        await get_callees(entity_id="repo::Target.method", ctx=mock_ctx)
+        call_kwargs = mock_graph.get_callees.call_args.kwargs
+        assert call_kwargs["entity_id"] == "repo::Target.method"
+        assert call_kwargs["method_name"] is None
+
+    async def test_get_callees_raises_when_no_method_name_or_entity_id(self, mock_ctx, mock_graph):
+        """Must raise ValueError when neither method_name nor entity_id is provided."""
+        with pytest.raises(ValueError, match="method_name or entity_id"):
+            await get_callees(ctx=mock_ctx)
 
 
 # =============================================================================
@@ -265,6 +321,54 @@ class TestGetFunctionContextTool:
         assert len(result["callees"]) == 1
         assert result["callees"][0]["name"] == "callee_fn"
         assert result["callees"][0]["entity_type"] == "hook"
+
+    async def test_get_function_context_accepts_entity_id_for_chaining(self, mock_ctx, mock_graph):
+        """MCP tool must accept entity_id as an input parameter and pass it
+        through to the backend, enabling handle-first chained traversal from
+        a prior tool result's entity_id field."""
+        mock_graph.get_function_context.return_value = FunctionContext(
+            name="my_func",
+            full_name="module.MyClass.my_func",
+            file_path="src/module.py",
+            repository="repo",
+            code="def my_func(): pass",
+            signature="def my_func()",
+            docstring=None,
+            class_name="MyClass",
+            callers=[],
+            callees=[],
+        )
+        await get_function_context(
+            method_name="ignored",
+            entity_id="repo::Target.method",
+            ctx=mock_ctx,
+        )
+        call_kwargs = mock_graph.get_function_context.call_args.kwargs
+        assert call_kwargs["entity_id"] == "repo::Target.method"
+
+    async def test_get_function_context_with_entity_id_only(self, mock_ctx, mock_graph):
+        """Function context must be retrievable using only entity_id."""
+        mock_graph.get_function_context.return_value = FunctionContext(
+            name="my_func",
+            full_name="module.MyClass.my_func",
+            file_path="src/module.py",
+            repository="repo",
+            code="def my_func(): pass",
+            signature="def my_func()",
+            docstring=None,
+            class_name="MyClass",
+            callers=[],
+            callees=[],
+        )
+        await get_function_context(entity_id="repo::Target.method", ctx=mock_ctx)
+        call_kwargs = mock_graph.get_function_context.call_args.kwargs
+        assert call_kwargs["entity_id"] == "repo::Target.method"
+        assert call_kwargs["method_name"] is None
+
+    async def test_get_function_context_raises_when_no_method_name_or_entity_id(self, mock_ctx, mock_graph):
+        """Must raise ValueError when neither method_name nor entity_id is provided."""
+        with pytest.raises(ValueError, match="method_name or entity_id"):
+            await get_function_context(ctx=mock_ctx)
 
 
 # =============================================================================
@@ -520,6 +624,54 @@ class TestFindSymbolsTool:
         assert call_kwargs["language"] == "Python"
         assert call_kwargs["stereotype"] == "test"
 
+    async def test_find_symbols_default_code_mode_none(self, mock_ctx, mock_graph):
+        """find_symbols should default to code_mode='none' and pass it
+        through to the backend so identifier lookups don't dump source.
+
+        Note: the backend is fully mocked (mock_graph.find_symbols is an
+        AsyncMock), so the server never invokes the real backend's
+        _apply_code_mode helper. The only diagnostic assertion here is
+        that the server passes the default 'none' through to the backend
+        in kwargs. Asserting on the returned dict's 'code' field would
+        merely echo whatever the fixture carries and add no coverage.
+        """
+        mock_graph.find_symbols.return_value = [
+            CodeEntity(
+                name="Foo",
+                file_path="Foo.java",
+                repository="repo",
+                entity_id="repo::Foo",
+                line_start=1,
+                line_end=100,
+                code=None,
+                signature="public class Foo",
+                entity_type="class",
+                language="Java",
+                modifiers=["public"],
+                content_hash="h",
+            ),
+        ]
+
+        await find_symbols(query="Foo", ctx=mock_ctx)
+
+        # The default code_mode must be passed through as 'none'.
+        call_kwargs = mock_graph.find_symbols.call_args.kwargs
+        assert call_kwargs["code_mode"] == "none", \
+            f"Expected default code_mode='none'; got {call_kwargs.get('code_mode')!r}"
+
+    async def test_find_symbols_invalid_code_mode_defaults_to_none(
+        self, mock_ctx, mock_graph
+    ):
+        """Invalid code_mode falls back to 'none' for find_symbols.
+
+        Mirrors TestSearchCodeTool.test_invalid_code_mode_defaults_to_preview
+        but asserts find_symbols' default ('none') per server.py:551-553.
+        """
+        mock_graph.find_symbols.return_value = []
+        await find_symbols(query="test", code_mode="bogus_value", ctx=mock_ctx)
+        call_kwargs = mock_graph.find_symbols.call_args.kwargs
+        assert call_kwargs["code_mode"] == "none"
+
 
 # =============================================================================
 # get_file_context
@@ -594,6 +746,7 @@ class TestGetHookUsageTool:
                 entity_type="method",
                 relationship_type="USES_HOOK",
                 truncated=True,
+                entity_id="repo::App.renderApp",
             ),
         ]
         result = await get_hook_usage(hook_name="useState", ctx=mock_ctx)
@@ -608,6 +761,7 @@ class TestGetHookUsageTool:
                 "entity_type": "method",
                 "relationship_type": "USES_HOOK",
                 "truncated": True,
+                "entity_id": "repo::App.renderApp",
             },
         ]
 
@@ -687,3 +841,97 @@ class TestGetImpactTool:
         assert len(result["other_callers"]) == 1
         assert result["other_callers"][0]["name"] == "helper"
         assert result["truncated"] is False
+
+    async def test_get_impact_accepts_entity_id_for_chaining(self, mock_ctx, mock_graph):
+        """MCP tool must accept entity_id as an input parameter and pass it
+        through to the backend, enabling handle-first chained traversal from
+        a prior tool result's entity_id field."""
+        mock_graph.get_impact.return_value = ImpactResult(
+            target_name="process",
+            target_file="src/proc.py",
+            target_repository="repo",
+            total_callers=0,
+            test_count=0,
+            endpoint_count=0,
+            affected_tests=[],
+            affected_endpoints=[],
+            other_callers=[],
+            truncated=False,
+        )
+        await get_impact(
+            method_name="ignored",
+            entity_id="repo::Target.method",
+            ctx=mock_ctx,
+        )
+        call_kwargs = mock_graph.get_impact.call_args.kwargs
+        assert call_kwargs["entity_id"] == "repo::Target.method"
+
+    async def test_get_impact_with_entity_id_only(self, mock_ctx, mock_graph):
+        """Impact analysis must be callable using only entity_id."""
+        mock_graph.get_impact.return_value = ImpactResult(
+            target_name="process",
+            target_file="src/proc.py",
+            target_repository="repo",
+            total_callers=0,
+            test_count=0,
+            endpoint_count=0,
+            affected_tests=[],
+            affected_endpoints=[],
+            other_callers=[],
+            truncated=False,
+        )
+        await get_impact(entity_id="repo::Target.method", ctx=mock_ctx)
+        call_kwargs = mock_graph.get_impact.call_args.kwargs
+        assert call_kwargs["entity_id"] == "repo::Target.method"
+        assert call_kwargs["method_name"] is None
+
+    async def test_get_impact_raises_when_no_method_name_or_entity_id(self, mock_ctx, mock_graph):
+        """Must raise ValueError when neither method_name nor entity_id is provided."""
+        with pytest.raises(ValueError, match="method_name or entity_id"):
+            await get_impact(ctx=mock_ctx)
+
+    async def test_get_impact_response_includes_entity_id_in_callers(self, mock_ctx, mock_graph):
+        """affected_tests, affected_endpoints, and other_callers must
+        include entity_id for downstream chaining."""
+        test_caller = CallGraphNode(
+            name="test_process",
+            file_path="tests/test_proc.py",
+            repository="repo",
+            depth=2,
+            is_test=True,
+            entity_id="repo::test_proc.test_process",
+        )
+        endpoint_caller = CallGraphNode(
+            name="handleRequest",
+            file_path="src/api.py",
+            repository="repo",
+            depth=1,
+            is_endpoint=True,
+            entity_id="repo::api.handleRequest",
+        )
+        other_caller = CallGraphNode(
+            name="helper",
+            file_path="src/util.py",
+            repository="repo",
+            depth=3,
+            entity_id="repo::util.helper",
+        )
+        mock_graph.get_impact.return_value = ImpactResult(
+            target_name="process",
+            target_file="src/proc.py",
+            target_repository="repo",
+            total_callers=3,
+            test_count=1,
+            endpoint_count=1,
+            affected_tests=[test_caller],
+            affected_endpoints=[endpoint_caller],
+            other_callers=[other_caller],
+            truncated=False,
+        )
+        result = await get_impact(method_name="process", ctx=mock_ctx)
+        for category in ["affected_tests", "affected_endpoints", "other_callers"]:
+            for caller in result[category]:
+                assert "entity_id" in caller, f"Missing entity_id in {category}"
+        assert result["affected_tests"][0]["entity_id"] == "repo::test_proc.test_process"
+        assert result["affected_endpoints"][0]["entity_id"] == "repo::api.handleRequest"
+        assert result["other_callers"][0]["entity_id"] == "repo::util.helper"

@@ -134,6 +134,7 @@ class TestCallGraphNode:
             name="caller",
             file_path="/src/bar.py",
             repository="repo-x",
+            entity_id="repo::test.foo",
             signature="caller() -> None",
             line_start=5,
             depth=3,
@@ -146,6 +147,7 @@ class TestCallGraphNode:
         assert node.name == "caller"
         assert node.file_path == "/src/bar.py"
         assert node.repository == "repo-x"
+        assert node.entity_id == "repo::test.foo"
         assert node.signature == "caller() -> None"
         assert node.line_start == 5
         assert node.depth == 3
@@ -158,6 +160,10 @@ class TestCallGraphNode:
     def test_default_repository_is_none(self):
         node = CallGraphNode(name="n", file_path="/a.py")
         assert node.repository is None
+
+    def test_default_entity_id_is_none(self):
+        node = CallGraphNode(name="foo", file_path="foo.py")
+        assert node.entity_id is None
 
     def test_default_signature_is_none(self):
         node = CallGraphNode(name="n", file_path="/a.py")

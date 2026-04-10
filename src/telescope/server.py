@@ -8,7 +8,9 @@ from collections.abc import AsyncIterator
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.session import ServerSession
 
-from .graph_client import GraphClient
+from .backends.base import ReadBackend
+from .backends.factory import create_read_backend
+from .config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +23,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AppContext:
     """Shared resources initialized at startup."""
-    graph: GraphClient
+    graph: ReadBackend
 
 
 @asynccontextmanager
@@ -29,7 +31,8 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     """Initialize and cleanup resources."""
     logger.info("Initializing Telescope server...")
 
-    graph = GraphClient()
+    config = get_config()
+    graph = create_read_backend(config)
     await graph.connect()
 
     logger.info("Telescope server ready")
@@ -159,6 +162,7 @@ def _call_node_to_dict(node) -> dict:
         "entity_type": node.entity_type,
         "relationship_type": node.relationship_type,
         "truncated": node.truncated,
+        "entity_id": node.entity_id,
     }
 
 
@@ -238,10 +242,11 @@ async def search_code(
 
 @mcp.tool()
 async def get_callers(
-    method_name: str,
     ctx: Context[ServerSession, AppContext],
+    method_name: str | None = None,
     repository: str | None = None,
     file_path: str | None = None,
+    entity_id: str | None = None,
     depth: int = 1,
     limit: int = 50,
 ) -> list[dict]:
@@ -251,9 +256,11 @@ async def get_callers(
     Use this to understand the impact of changing a function - who depends on it?
 
     Args:
-        method_name: Name of the method to find callers for
+        method_name: Name of the method to find callers for (required unless entity_id is set)
         repository: Filter by repository name (e.g., "consumer-operations")
         file_path: Disambiguate if multiple methods have the same name
+        entity_id: Exact graph entity id from a prior tool result (bypasses name-based
+                   ambiguity resolution; preferred for chained traversal)
         depth: How many levels up to traverse (default 1, max 3)
         limit: Maximum callers to return (default 50, max 200)
 
@@ -261,12 +268,18 @@ async def get_callers(
         List of functions that call this method. Each result includes
         a `truncated` flag when additional callers exist beyond the limit.
     """
+    if not method_name and not entity_id:
+        raise ValueError(
+            "Must provide either method_name or entity_id"
+        )
+
     graph = ctx.request_context.lifespan_context.graph
 
     results = await graph.get_callers(
         method_name=method_name,
         file_path=file_path,
         repository=repository,
+        entity_id=entity_id,
         depth=min(depth, 3),
         limit=min(limit, 200),
     )
@@ -276,10 +289,11 @@ async def get_callers(
 
 @mcp.tool()
 async def get_callees(
-    method_name: str,
     ctx: Context[ServerSession, AppContext],
+    method_name: str | None = None,
     repository: str | None = None,
     file_path: str | None = None,
+    entity_id: str | None = None,
     depth: int = 1,
     limit: int = 50,
 ) -> list[dict]:
@@ -289,9 +303,11 @@ async def get_callees(
     Use this to understand what a method depends on before modifying it.
 
     Args:
-        method_name: Name of the method to analyze
+        method_name: Name of the method to analyze (required unless entity_id is set)
         repository: Filter by repository name (e.g., "consumer-operations")
         file_path: Disambiguate if multiple methods have the same name
+        entity_id: Exact graph entity id from a prior tool result (bypasses name-based
+                   ambiguity resolution; preferred for chained traversal)
         depth: How many levels down to traverse (default 1, max 3)
         limit: Maximum graph targets to return (default 50, max 200)
 
@@ -299,12 +315,18 @@ async def get_callees(
         List of methods, constructors, references, and hooks reached from this method.
         Each result includes a `truncated` flag when additional targets exist.
     """
+    if not method_name and not entity_id:
+        raise ValueError(
+            "Must provide either method_name or entity_id"
+        )
+
     graph = ctx.request_context.lifespan_context.graph
 
     results = await graph.get_callees(
         method_name=method_name,
         file_path=file_path,
         repository=repository,
+        entity_id=entity_id,
         depth=min(depth, 3),
         limit=min(limit, 200),
     )
@@ -314,10 +336,11 @@ async def get_callees(
 
 @mcp.tool()
 async def get_function_context(
-    method_name: str,
     ctx: Context[ServerSession, AppContext],
+    method_name: str | None = None,
     repository: str | None = None,
     file_path: str | None = None,
+    entity_id: str | None = None,
 ) -> dict:
     """
     Get comprehensive context for a function before modifying it.
@@ -326,23 +349,32 @@ async def get_function_context(
     This is the go-to tool before making changes to understand full impact.
 
     Args:
-        method_name: Name of the method
+        method_name: Name of the method (required unless entity_id is set)
         repository: Filter by repository name (e.g., "consumer-operations")
         file_path: Disambiguate if multiple methods have the same name
+        entity_id: Exact graph entity id from a prior tool result (bypasses name-based
+                   ambiguity resolution; preferred for chained traversal)
 
     Returns:
         Full context including code and relationships
     """
+    if not method_name and not entity_id:
+        raise ValueError(
+            "Must provide either method_name or entity_id"
+        )
+
     graph = ctx.request_context.lifespan_context.graph
 
     result = await graph.get_function_context(
         method_name=method_name,
         file_path=file_path,
         repository=repository,
+        entity_id=entity_id,
     )
 
     if not result:
-        raise ValueError(f"Method '{method_name}' not found in graph")
+        identifier = method_name or entity_id
+        raise ValueError(f"Method '{identifier}' not found in graph")
 
     return {
         "name": result.name,
@@ -519,6 +551,7 @@ async def find_symbols(
     stereotype: str | None = None,
     limit: int = 20,
     exact: bool = False,
+    code_mode: str = "none",
 ) -> list[dict]:
     """
     Find exact or substring symbol matches across the full Constellation graph.
@@ -526,6 +559,13 @@ async def find_symbols(
     Use this when you know the symbol or path fragment you want and need more than
     vector search can provide, including fields, packages, hooks, references, and files.
     You can also filter by language and stereotype.
+
+    Args:
+        code_mode: How much code to include in results (default "none"):
+            - "none": No code, just metadata (smallest response, default)
+            - "signature": Only method/class signature
+            - "preview": First 10 lines of code
+            - "full": Complete source code (use sparingly)
     """
     if entity_types:
         invalid = sorted(set(entity_types) - VALID_SYMBOL_ENTITY_TYPES)
@@ -534,6 +574,12 @@ async def find_symbols(
                 f"Invalid entity_types {invalid}. "
                 f"Valid values: {', '.join(sorted(VALID_SYMBOL_ENTITY_TYPES))}"
             )
+
+    # Validate code_mode (mirrors search_code's behavior of silently
+    # coercing invalid values to the default).
+    valid_modes = {"none", "signature", "preview", "full"}
+    if code_mode not in valid_modes:
+        code_mode = "none"
 
     graph = ctx.request_context.lifespan_context.graph
     results = await graph.find_symbols(
@@ -545,6 +591,7 @@ async def find_symbols(
         stereotype=stereotype,
         limit=min(limit, 50),
         exact=exact,
+        code_mode=code_mode,
     )
     return [
         _entity_to_dict(r)
@@ -643,10 +690,11 @@ async def get_hook_usage(
 
 @mcp.tool()
 async def get_impact(
-    method_name: str,
     ctx: Context[ServerSession, AppContext],
+    method_name: str | None = None,
     repository: str | None = None,
     file_path: str | None = None,
+    entity_id: str | None = None,
     depth: int = 10,
     summary_only: bool = False,
     limit: int | None = None,
@@ -660,9 +708,11 @@ async def get_impact(
     Use this BEFORE making changes to understand full impact.
 
     Args:
-        method_name: Name of the method to analyze
+        method_name: Name of the method to analyze (required unless entity_id is set)
         repository: Filter by repository name
         file_path: Disambiguate if multiple methods have same name
+        entity_id: Exact graph entity id from a prior tool result (bypasses name-based
+                   ambiguity resolution; preferred for chained traversal)
         depth: Max call chain depth (default 10, use higher for deeper analysis)
         summary_only: If True, return only counts without caller details (fast overview)
         limit: Max callers per category (tests, endpoints, others). Use for large methods.
@@ -680,19 +730,26 @@ async def get_impact(
         # Full details (default, use for small methods)
         get_impact("validateUser")
     """
+    if not method_name and not entity_id:
+        raise ValueError(
+            "Must provide either method_name or entity_id"
+        )
+
     graph = ctx.request_context.lifespan_context.graph
 
     result = await graph.get_impact(
         method_name=method_name,
         file_path=file_path,
         repository=repository,
+        entity_id=entity_id,
         depth=depth,
         summary_only=summary_only,
         limit=limit,
     )
 
     if not result:
-        raise ValueError(f"Method '{method_name}' not found in graph")
+        identifier = method_name or entity_id
+        raise ValueError(f"Method '{identifier}' not found in graph")
 
     return {
         "target_name": result.target_name,
@@ -702,15 +759,18 @@ async def get_impact(
         "test_count": result.test_count,
         "endpoint_count": result.endpoint_count,
         "affected_tests": [
-            {"name": c.name, "file_path": c.file_path, "repository": c.repository, "depth": c.depth}
+            {"name": c.name, "file_path": c.file_path, "repository": c.repository,
+             "entity_id": c.entity_id, "depth": c.depth}
             for c in result.affected_tests
         ],
         "affected_endpoints": [
-            {"name": c.name, "file_path": c.file_path, "repository": c.repository, "depth": c.depth}
+            {"name": c.name, "file_path": c.file_path, "repository": c.repository,
+             "entity_id": c.entity_id, "depth": c.depth}
             for c in result.affected_endpoints
         ],
         "other_callers": [
-            {"name": c.name, "file_path": c.file_path, "repository": c.repository, "depth": c.depth}
+            {"name": c.name, "file_path": c.file_path, "repository": c.repository,
+             "entity_id": c.entity_id, "depth": c.depth}
             for c in result.other_callers
         ],
         "truncated": result.truncated,

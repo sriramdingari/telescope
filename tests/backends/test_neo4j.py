@@ -1,4 +1,4 @@
-"""Tests for the Neo4j graph client."""
+"""Tests for the Neo4jReadBackend."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -30,23 +30,23 @@ def test_config():
 
 @pytest.fixture()
 def patched_config(test_config):
-    """Patch get_config in graph_client to return test_config."""
-    with patch("telescope.graph_client.get_config", return_value=test_config):
+    """Patch get_config in backends.neo4j to return test_config."""
+    with patch("telescope.backends.neo4j.get_config", return_value=test_config):
         yield test_config
 
 
-class TestGraphClientConnect:
-    """Tests for GraphClient.connect()."""
+class TestNeo4jReadBackendConnect:
+    """Tests for Neo4jReadBackend.connect()."""
 
     async def test_connect_creates_driver(self, patched_config):
         """Verify AsyncGraphDatabase.driver is called with correct URI and auth."""
-        with patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.graph_client.AsyncOpenAI"):
+        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.backends.neo4j.AsyncOpenAI"):
             mock_driver = AsyncMock()
             mock_driver.verify_connectivity = AsyncMock()
             mock_gdb.driver = MagicMock(return_value=mock_driver)
-            from telescope.graph_client import GraphClient
-            client = GraphClient()
+            from telescope.backends.neo4j import Neo4jReadBackend
+            client = Neo4jReadBackend()
             await client.connect()
             mock_gdb.driver.assert_called_once_with(
                 "bolt://localhost:7687",
@@ -55,23 +55,23 @@ class TestGraphClientConnect:
 
     async def test_connect_verifies_connectivity(self, patched_config, mock_neo4j_driver):
         """Startup should fail fast if Neo4j connectivity is broken."""
-        with patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.graph_client.AsyncOpenAI"):
+        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.backends.neo4j.AsyncOpenAI"):
             mock_gdb.driver = MagicMock(return_value=mock_neo4j_driver)
-            from telescope.graph_client import GraphClient
-            client = GraphClient()
+            from telescope.backends.neo4j import Neo4jReadBackend
+            client = Neo4jReadBackend()
             await client.connect()
             mock_neo4j_driver.verify_connectivity.assert_awaited_once()
 
     async def test_connect_creates_openai_client(self, patched_config):
         """Verify AsyncOpenAI is called with api_key."""
-        with patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.graph_client.AsyncOpenAI") as mock_openai:
+        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.backends.neo4j.AsyncOpenAI") as mock_openai:
             mock_driver = AsyncMock()
             mock_driver.verify_connectivity = AsyncMock()
             mock_gdb.driver = MagicMock(return_value=mock_driver)
-            from telescope.graph_client import GraphClient
-            client = GraphClient()
+            from telescope.backends.neo4j import Neo4jReadBackend
+            client = Neo4jReadBackend()
             await client.connect()
             call_kwargs = mock_openai.call_args[1]
             assert call_kwargs["api_key"] == "sk-test-key"
@@ -79,14 +79,14 @@ class TestGraphClientConnect:
     async def test_connect_passes_base_url_when_set(self, test_config):
         """When openai_base_url is set, AsyncOpenAI is called with base_url."""
         test_config.openai_base_url = "https://my-custom-openai.example.com"
-        with patch("telescope.graph_client.get_config", return_value=test_config), \
-             patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.graph_client.AsyncOpenAI") as mock_openai:
+        with patch("telescope.backends.neo4j.get_config", return_value=test_config), \
+             patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.backends.neo4j.AsyncOpenAI") as mock_openai:
             mock_driver = AsyncMock()
             mock_driver.verify_connectivity = AsyncMock()
             mock_gdb.driver = MagicMock(return_value=mock_driver)
-            from telescope.graph_client import GraphClient
-            client = GraphClient()
+            from telescope.backends.neo4j import Neo4jReadBackend
+            client = Neo4jReadBackend()
             await client.connect()
             call_kwargs = mock_openai.call_args[1]
             assert call_kwargs.get("base_url") == "https://my-custom-openai.example.com"
@@ -94,48 +94,48 @@ class TestGraphClientConnect:
     async def test_connect_omits_base_url_when_none(self, patched_config):
         """When openai_base_url is None, AsyncOpenAI is NOT called with base_url."""
         assert patched_config.openai_base_url is None
-        with patch("telescope.graph_client.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.graph_client.AsyncOpenAI") as mock_openai:
+        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
+             patch("telescope.backends.neo4j.AsyncOpenAI") as mock_openai:
             mock_driver = AsyncMock()
             mock_driver.verify_connectivity = AsyncMock()
             mock_gdb.driver = MagicMock(return_value=mock_driver)
-            from telescope.graph_client import GraphClient
-            client = GraphClient()
+            from telescope.backends.neo4j import Neo4jReadBackend
+            client = Neo4jReadBackend()
             await client.connect()
             call_kwargs = mock_openai.call_args[1]
             assert "base_url" not in call_kwargs
 
 
-class TestGraphClientClose:
-    """Tests for GraphClient.close()."""
+class TestNeo4jReadBackendClose:
+    """Tests for Neo4jReadBackend.close()."""
 
     async def test_close_calls_driver_close(self, patched_config, mock_neo4j_driver):
         """Verify driver.close() is called when driver exists."""
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._driver = mock_neo4j_driver
         await client.close()
         mock_neo4j_driver.close.assert_called_once()
 
     async def test_close_calls_openai_close(self, patched_config, mock_openai_client):
         """Verify the OpenAI client is closed when present."""
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._openai = mock_openai_client
         await client.close()
         mock_openai_client.close.assert_awaited_once()
 
     async def test_close_safe_when_not_connected(self, patched_config):
         """No error when _driver is None (never connected)."""
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         assert client._driver is None
         # Should not raise
         await client.close()
 
 
-class TestGraphClientQuery:
-    """Tests for GraphClient._query()."""
+class TestNeo4jReadBackendQuery:
+    """Tests for Neo4jReadBackend._query()."""
 
     async def test_query_runs_cypher_and_returns_dicts(
         self, patched_config, mock_neo4j_driver, mock_neo4j_result
@@ -145,8 +145,8 @@ class TestGraphClientQuery:
         mock_neo4j_driver.session.return_value.run = AsyncMock(
             return_value=mock_neo4j_result(expected_data)
         )
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._driver = mock_neo4j_driver
         result = await client._query("MATCH (n) RETURN n")
         assert result == expected_data
@@ -158,8 +158,8 @@ class TestGraphClientQuery:
         mock_session = mock_neo4j_driver.session.return_value
         mock_result = mock_neo4j_result([{"name": "foo"}])
         mock_session.run = AsyncMock(return_value=mock_result)
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._driver = mock_neo4j_driver
         await client._query("MATCH (n) RETURN n")
         mock_result.data.assert_awaited_once()
@@ -171,8 +171,8 @@ class TestGraphClientQuery:
         """Verify params are passed to session.run()."""
         mock_session = mock_neo4j_driver.session.return_value
         mock_session.run = AsyncMock(return_value=mock_neo4j_result([]))
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._driver = mock_neo4j_driver
         await client._query("MATCH (n {name: $name}) RETURN n", name="MyClass")
         mock_session.run.assert_called_once_with(
@@ -180,15 +180,15 @@ class TestGraphClientQuery:
         )
 
 
-class TestGraphClientGetEmbedding:
-    """Tests for GraphClient._get_embedding()."""
+class TestNeo4jReadBackendGetEmbedding:
+    """Tests for Neo4jReadBackend._get_embedding()."""
 
     async def test_get_embedding_calls_openai(
         self, patched_config, mock_openai_client
     ):
         """Verify embeddings.create() is called with correct model, input, dimensions."""
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._openai = mock_openai_client
         await client._get_embedding("search query text")
         mock_openai_client.embeddings.create.assert_called_once_with(
@@ -205,8 +205,8 @@ class TestGraphClientGetEmbedding:
         mock_openai_client.embeddings.create = AsyncMock(
             return_value=mock_openai_response(embedding=expected_vector)
         )
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
         client._openai = mock_openai_client
         result = await client._get_embedding("some text")
         assert result == expected_vector
@@ -253,17 +253,17 @@ def _make_search_result(
 
 @pytest.fixture()
 def graph_client(test_config):
-    """Create a GraphClient with mocked internals for search_code tests."""
-    with patch("telescope.graph_client.get_config", return_value=test_config):
-        from telescope.graph_client import GraphClient
-        client = GraphClient()
+    """Create a Neo4jReadBackend with mocked internals for search_code tests."""
+    with patch("telescope.backends.neo4j.get_config", return_value=test_config):
+        from telescope.backends.neo4j import Neo4jReadBackend
+        client = Neo4jReadBackend()
     client._driver = AsyncMock()
     client._openai = AsyncMock()
     return client
 
 
 class TestSearchCode:
-    """Tests for GraphClient.search_code()."""
+    """Tests for Neo4jReadBackend.search_code()."""
 
     async def test_search_code_calls_get_embedding(self, graph_client):
         """Verify _get_embedding called with query text."""
@@ -464,6 +464,7 @@ class TestSearchCode:
             exact=True,
             language=None,
             stereotype=None,
+            code_mode="preview",
         )
         assert [result.name for result in results] == ["useState", "semantic"]
 
@@ -479,7 +480,7 @@ class TestSearchCode:
 
 
 class TestGetCallers:
-    """Tests for GraphClient.get_callers()."""
+    """Tests for Neo4jReadBackend.get_callers()."""
 
     async def test_get_callers_basic(self, graph_client):
         """Returns list of CallGraphNode from mock results."""
@@ -603,15 +604,46 @@ class TestGetCallers:
         assert [result.name for result in results] == ["caller1", "caller2"]
         assert all(result.truncated is True for result in results)
 
+    async def test_get_callers_returns_entity_id_for_chaining(self, graph_client):
+        """CallGraphNode must carry entity_id so agents can chain
+        get_callers → get_callers(entity_id=...) without re-resolving
+        by name. Symmetric to the Postgres fix."""
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "entity_id": "repo::Caller.call_method",
+                "name": "call_method",
+                "file_path": "caller.py",
+                "repository": "repo",
+                "signature": "def call_method(self)",
+                "line_number": 5,
+                "entity_type": "Method",
+                "relationship_type": "CALLS",
+                "depth": 1,
+            },
+        ])
+
+        results = await graph_client.get_callers("method")
+
+        assert len(results) == 1
+        assert results[0].entity_id == "repo::Caller.call_method", (
+            f"CallGraphNode.entity_id must be populated; got: {results[0].entity_id}"
+        )
+        # The Cypher RETURN must expose caller.id AS entity_id
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "caller.id AS entity_id" in cypher_arg, (
+            f"get_callers Cypher RETURN must expose caller.id AS entity_id; got: {cypher_arg}"
+        )
+
 
 class TestGetCallees:
-    """Tests for GraphClient.get_callees()."""
+    """Tests for Neo4jReadBackend.get_callees()."""
 
     async def test_get_callees_basic(self, graph_client):
         """Returns list of CallGraphNode from mock results."""
         graph_client._query = AsyncMock(side_effect=[
             [
                 {
+                    "entity_id": "my-repo::com.example.Service.callee1",
                     "name": "callee1",
                     "file_path": "src/service.py",
                     "repository": "my-repo",
@@ -622,6 +654,7 @@ class TestGetCallees:
                     "depth": 1,
                 },
                 {
+                    "entity_id": "my-repo::requests.get",
                     "name": "requests.get",
                     "file_path": "src/dao.py",
                     "repository": "my-repo",
@@ -641,8 +674,10 @@ class TestGetCallees:
         assert by_name["callee1"].repository == "my-repo"
         assert by_name["callee1"].signature == "def callee1()"
         assert by_name["callee1"].entity_type == "method"
+        assert by_name["callee1"].entity_id == "my-repo::com.example.Service.callee1"
         assert by_name["requests.get"].entity_type == "reference"
         assert by_name["requests.get"].relationship_type == "CALLS"
+        assert by_name["requests.get"].entity_id == "my-repo::requests.get"
 
     async def test_get_callees_matches_method_or_constructor(self, graph_client):
         """Verify Cypher contains (m:Method OR m:Constructor)."""
@@ -724,6 +759,7 @@ class TestGetCallees:
             [],
             [
                 {
+                    "entity_id": "repo::hook.useState",
                     "name": "useState",
                     "file_path": "src/App.tsx",
                     "repository": "my-repo",
@@ -739,6 +775,7 @@ class TestGetCallees:
         assert results[0].name == "useState"
         assert results[0].entity_type == "hook"
         assert results[0].relationship_type == "USES_HOOK"
+        assert results[0].entity_id == "repo::hook.useState"
 
     async def test_get_callees_uses_limit_and_marks_truncation(self, graph_client):
         """Callee traversal should honor the merged result limit and mark truncation."""
@@ -783,7 +820,7 @@ def _make_function_context_result(
 
 
 class TestGetFunctionContext:
-    """Tests for GraphClient.get_function_context()."""
+    """Tests for Neo4jReadBackend.get_function_context()."""
 
     async def test_get_function_context_returns_context(self, graph_client):
         """Basic return with all fields populated."""
@@ -872,6 +909,29 @@ class TestGetFunctionContext:
         cypher_arg = graph_client._query.call_args[0][0]
         assert "(m:Method OR m:Constructor)" in cypher_arg
 
+    async def test_get_function_context_accepts_entity_id(self, graph_client):
+        """get_function_context must accept entity_id and use it in the
+        method match, bypassing name-based ambiguity resolution so agents
+        can chain from a prior tool result's entity_id field."""
+        graph_client._query = AsyncMock(return_value=[_make_function_context_result()])
+        graph_client.get_callers = AsyncMock(return_value=[])
+        graph_client.get_callees = AsyncMock(return_value=[])
+
+        await graph_client.get_function_context(
+            "ignored", entity_id="repo::Target.method"
+        )
+
+        kwargs = graph_client._query.call_args.kwargs
+        assert kwargs.get("entity_id") == "repo::Target.method", (
+            f"get_function_context must pass entity_id into Cypher params; "
+            f"got: {kwargs}"
+        )
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "m.id = $entity_id" in cypher_arg, (
+            f"get_function_context Cypher must constrain m.id = $entity_id; "
+            f"got: {cypher_arg}"
+        )
+
     async def test_get_function_context_with_filters(self, graph_client):
         """Verify file_path and repository filters work."""
         graph_client._query = AsyncMock(return_value=[_make_function_context_result()])
@@ -935,7 +995,7 @@ def _make_class_hierarchy_result(
 
 
 class TestGetClassHierarchy:
-    """Tests for GraphClient.get_class_hierarchy()."""
+    """Tests for Neo4jReadBackend.get_class_hierarchy()."""
 
     async def test_get_class_hierarchy_returns_hierarchy(self, graph_client):
         """Basic return with all fields populated."""
@@ -1085,7 +1145,7 @@ class TestGetClassHierarchy:
 
 
 class TestListRepositories:
-    """Tests for GraphClient.list_repositories()."""
+    """Tests for Neo4jReadBackend.list_repositories()."""
 
     async def test_list_repositories_queries_repository_nodes(self, graph_client):
         """Verify Cypher contains MATCH (r:Repository) not aggregation."""
@@ -1115,7 +1175,7 @@ class TestListRepositories:
 
 
 class TestGetRepositoryContext:
-    """Tests for GraphClient.get_repository_context()."""
+    """Tests for Neo4jReadBackend.get_repository_context()."""
 
     async def test_get_repository_context_returns_repository_metadata(self, graph_client):
         graph_client._query = AsyncMock(side_effect=[
@@ -1176,7 +1236,7 @@ class TestGetRepositoryContext:
 
 
 class TestGetPackageContext:
-    """Tests for GraphClient.get_package_context()."""
+    """Tests for Neo4jReadBackend.get_package_context()."""
 
     async def test_get_package_context_returns_package_members(self, graph_client):
         graph_client._query = AsyncMock(return_value=[
@@ -1242,7 +1302,7 @@ class TestGetPackageContext:
 
 
 class TestGetCodebaseOverview:
-    """Tests for GraphClient.get_codebase_overview()."""
+    """Tests for Neo4jReadBackend.get_codebase_overview()."""
 
     async def test_get_codebase_overview_returns_stats(self, graph_client):
         """Basic return with all counts."""
@@ -1354,7 +1414,10 @@ class TestGetCodebaseOverview:
                 "references": 1,
                 "exports": 4,
                 "languages": ["Java"],
-                "packages": ["com.example", "com.util"],
+                "packages": [
+                    {"id": "repo::com.example", "name": "com.example"},
+                    {"id": "repo::com.util", "name": "com.util"},
+                ],
             }],
             [],  # top classes
             [],  # entry points
@@ -1366,6 +1429,49 @@ class TestGetCodebaseOverview:
         # Verify Cypher contains Package match
         overview_cypher = graph_client._query.call_args_list[0][0][0]
         assert "Package" in overview_cypher
+
+    async def test_get_codebase_overview_reconstructs_nested_dotnet_namespaces(self, graph_client):
+        """Neo4j parity: codebase_overview.packages must reconstruct full
+        dotted names from pkg.id, not return raw leaf-only pkg.name.
+        Same _full_name_from_id pattern as the get_file_context fix.
+
+        After the Cypher change, the main query's `packages` field is
+        a list of {id, name} dicts instead of a list of strings.
+        """
+        graph_client._query = AsyncMock(side_effect=[
+            # 1. Main overview query
+            [{
+                "files": 1,
+                "classes": 1,
+                "interfaces": 0,
+                "methods": 0,
+                "constructors": 0,
+                "fields": 0,
+                "packages_count": 3,
+                "hooks": 0,
+                "references": 1,
+                "exports": 0,
+                "languages": ["csharp"],
+                "packages": [
+                    {"id": "repo::Company", "name": "Company"},
+                    {"id": "repo::Company.Product", "name": "Product"},
+                    {"id": "repo::Company.Product.Services", "name": "Services"},
+                ],
+            }],
+            [],  # 2. top classes
+            [],  # 3. entry points
+        ])
+
+        result = await graph_client.get_codebase_overview(
+            repository="repo", include_packages=True,
+        )
+
+        assert "Company.Product.Services" in result.packages, \
+            f"Expected full dotted namespace; got: {result.packages}"
+        assert "Services" not in result.packages, \
+            f"Leaf-only 'Services' should not appear; got: {result.packages}"
+        assert "Company" in result.packages
+        assert "Company.Product" in result.packages
 
     async def test_get_codebase_overview_omits_packages_by_default(self, graph_client):
         """include_packages=False returns empty packages."""
@@ -1443,6 +1549,108 @@ class TestGetCodebaseOverview:
 
         assert result.entry_points == ["ApiController.handleRequest", "main"]
 
+    async def test_get_codebase_overview_excludes_test_entities(self, graph_client):
+        """top_level_classes and entry_points must exclude nodes whose
+        stereotypes contain 'test', via a null-safe Cypher idiom.
+
+        Constellation never writes `is_test` as a Neo4j property — it
+        only writes `stereotypes`. So the filter MUST use
+        `'test' IN coalesce(x.stereotypes, [])`, NOT `x.is_test`.
+        Otherwise `NOT null = null` (falsy) filters out every row.
+        Covers both with-repository and without-repository branches.
+        """
+        # Shared stub overview row
+        overview_row = {
+            "files": 10, "classes": 5, "interfaces": 2,
+            "methods": 20, "constructors": 3, "fields": 6,
+            "packages_count": 2, "hooks": 0, "references": 1,
+            "exports": 4, "languages": ["Python"],
+        }
+
+        # --- with-repository branch ---
+        graph_client._query = AsyncMock(side_effect=[
+            [overview_row],
+            [],  # top classes
+            [],  # entry points
+        ])
+        await graph_client.get_codebase_overview(repository="repo")
+
+        top_classes_cypher = graph_client._query.call_args_list[1][0][0]
+        entry_points_cypher = graph_client._query.call_args_list[2][0][0]
+
+        # top_classes filter: null-safe stereotype-array idiom, negated.
+        assert (
+            "'test' IN coalesce(c.stereotypes, [])" in top_classes_cypher
+            or "'test' IN COALESCE(c.stereotypes, [])" in top_classes_cypher
+        ), (
+            f"top_classes Cypher must use the null-safe test-stereotype "
+            f"filter idiom; got: {top_classes_cypher}"
+        )
+        assert "NOT 'test' IN" in top_classes_cypher, (
+            f"top_classes filter must be negated (NOT ...); "
+            f"got: {top_classes_cypher}"
+        )
+        # Reject the old broken form
+        assert "NOT c.is_test" not in top_classes_cypher, (
+            f"top_classes must NOT use the broken `NOT c.is_test` filter "
+            f"(is_test is never written as a Neo4j property); "
+            f"got: {top_classes_cypher}"
+        )
+
+        # entry_points filter: same idiom on Method nodes.
+        assert (
+            "'test' IN coalesce(m.stereotypes, [])" in entry_points_cypher
+            or "'test' IN COALESCE(m.stereotypes, [])" in entry_points_cypher
+        ), (
+            f"entry_points Cypher must use the null-safe test-stereotype "
+            f"filter idiom; got: {entry_points_cypher}"
+        )
+        assert "NOT 'test' IN" in entry_points_cypher, (
+            f"entry_points filter must be negated (NOT ...); "
+            f"got: {entry_points_cypher}"
+        )
+        assert "NOT m.is_test" not in entry_points_cypher, (
+            f"entry_points must NOT use the broken `NOT m.is_test` filter; "
+            f"got: {entry_points_cypher}"
+        )
+
+        # --- without-repository branch ---
+        # The Cypher templates differ between with-repo and without-repo
+        # (top_classes_filter / entry_filter variables), so the filter must
+        # be present in both.
+        graph_client._query = AsyncMock(side_effect=[
+            [overview_row],
+            [],  # top classes
+            [],  # entry points
+        ])
+        await graph_client.get_codebase_overview()  # no repository
+
+        top_classes_cypher_no_repo = graph_client._query.call_args_list[1][0][0]
+        entry_points_cypher_no_repo = graph_client._query.call_args_list[2][0][0]
+
+        assert (
+            "'test' IN coalesce(c.stereotypes, [])" in top_classes_cypher_no_repo
+            or "'test' IN COALESCE(c.stereotypes, [])" in top_classes_cypher_no_repo
+        ), (
+            f"top_classes Cypher (no-repo branch) must use the null-safe "
+            f"test-stereotype filter idiom; got: {top_classes_cypher_no_repo}"
+        )
+        assert "NOT 'test' IN" in top_classes_cypher_no_repo, (
+            f"top_classes filter (no-repo branch) must be negated; "
+            f"got: {top_classes_cypher_no_repo}"
+        )
+        assert (
+            "'test' IN coalesce(m.stereotypes, [])" in entry_points_cypher_no_repo
+            or "'test' IN COALESCE(m.stereotypes, [])" in entry_points_cypher_no_repo
+        ), (
+            f"entry_points Cypher (no-repo branch) must use the null-safe "
+            f"test-stereotype filter idiom; got: {entry_points_cypher_no_repo}"
+        )
+        assert "NOT 'test' IN" in entry_points_cypher_no_repo, (
+            f"entry_points filter (no-repo branch) must be negated; "
+            f"got: {entry_points_cypher_no_repo}"
+        )
+
     async def test_get_codebase_overview_empty_results(self, graph_client):
         """Returns CodebaseOverview with defaults when no data."""
         graph_client._query = AsyncMock(return_value=[])
@@ -1474,9 +1682,11 @@ def _make_impact_caller(
     line_number=30,
     stereotypes=None,
     depth=1,
+    entity_id="my-repo::Caller.default",
 ):
     """Helper to build a mock Neo4j result dict for get_impact callers."""
     return {
+        "entity_id": entity_id,
         "name": name,
         "file_path": file_path,
         "repository": repository,
@@ -1502,7 +1712,7 @@ def _make_impact_target(
 
 
 class TestGetImpact:
-    """Tests for GraphClient.get_impact()."""
+    """Tests for Neo4jReadBackend.get_impact()."""
 
     async def test_get_impact_returns_result(self, graph_client):
         """Basic return with target info and counts."""
@@ -1532,9 +1742,30 @@ class TestGetImpact:
         graph_client._query = AsyncMock(side_effect=[
             [_make_impact_target()],
             [
-                _make_impact_caller(name="testProcessOrder", file_path="test/OrderTest.java", stereotypes=["test"], line_number=15, depth=1),
-                _make_impact_caller(name="handleOrderEndpoint", file_path="src/OrderController.java", stereotypes=["endpoint"], line_number=20, depth=2),
-                _make_impact_caller(name="checkOrder", file_path="src/OrderHelper.java", stereotypes=[], line_number=30, depth=1),
+                _make_impact_caller(
+                    name="testProcessOrder",
+                    file_path="test/OrderTest.java",
+                    stereotypes=["test"],
+                    line_number=15,
+                    depth=1,
+                    entity_id="my-repo::OrderTest.testProcessOrder",
+                ),
+                _make_impact_caller(
+                    name="handleOrderEndpoint",
+                    file_path="src/OrderController.java",
+                    stereotypes=["endpoint"],
+                    line_number=20,
+                    depth=2,
+                    entity_id="my-repo::OrderController.handleOrderEndpoint",
+                ),
+                _make_impact_caller(
+                    name="checkOrder",
+                    file_path="src/OrderHelper.java",
+                    stereotypes=[],
+                    line_number=30,
+                    depth=1,
+                    entity_id="my-repo::OrderHelper.checkOrder",
+                ),
             ],
         ])
 
@@ -1543,13 +1774,17 @@ class TestGetImpact:
         assert len(result.affected_tests) == 1
         assert result.affected_tests[0].name == "testProcessOrder"
         assert result.affected_tests[0].is_test is True
+        # entity_id must propagate through so agents can chain without re-resolving
+        assert result.affected_tests[0].entity_id == "my-repo::OrderTest.testProcessOrder"
 
         assert len(result.affected_endpoints) == 1
         assert result.affected_endpoints[0].name == "handleOrderEndpoint"
         assert result.affected_endpoints[0].is_endpoint is True
+        assert result.affected_endpoints[0].entity_id == "my-repo::OrderController.handleOrderEndpoint"
 
         assert len(result.other_callers) == 1
         assert result.other_callers[0].name == "checkOrder"
+        assert result.other_callers[0].entity_id == "my-repo::OrderHelper.checkOrder"
 
     async def test_get_impact_fallback_heuristics(self, graph_client):
         """'test' in name -> is_test, 'controller' in name -> is_endpoint."""
@@ -1688,9 +1923,33 @@ class TestGetImpact:
         assert "candidate_method.id ENDS WITH (candidate_method.name + $parameter_suffix)" in callers_cypher
         assert kwargs["parameter_suffix"] == "(String,int)"
 
+    async def test_get_impact_accepts_entity_id(self, graph_client):
+        """get_impact must accept entity_id and use it in the method match,
+        bypassing name-based ambiguity resolution so agents can chain from
+        a prior tool result's entity_id field."""
+        graph_client._query = AsyncMock(side_effect=[
+            [_make_impact_target(entity_id="repo::Target.method")],
+            [],
+        ])
+
+        await graph_client.get_impact("ignored", entity_id="repo::Target.method")
+
+        # The first _query call resolves the method target; it must
+        # pass entity_id through so the match uses m.id = $entity_id.
+        target_kwargs = graph_client._query.call_args_list[0].kwargs
+        assert target_kwargs.get("entity_id") == "repo::Target.method", (
+            f"get_impact must pass entity_id into the method match params; "
+            f"got: {target_kwargs}"
+        )
+        target_cypher = graph_client._query.call_args_list[0][0][0]
+        assert "m.id = $entity_id" in target_cypher, (
+            f"get_impact method match Cypher must constrain m.id = $entity_id; "
+            f"got: {target_cypher}"
+        )
+
 
 class TestFindSymbols:
-    """Tests for GraphClient.find_symbols()."""
+    """Tests for Neo4jReadBackend.find_symbols()."""
 
     async def test_find_symbols_queries_requested_entity_types(self, graph_client):
         graph_client._query = AsyncMock(return_value=[])
@@ -1797,9 +2056,124 @@ class TestFindSymbols:
         assert kwargs["search_query"] == "helper"
         assert "query" not in kwargs
 
+    async def test_find_symbols_applies_code_mode_none_by_default(self, graph_client):
+        """find_symbols should default to code_mode='none' so identifier
+        lookups don't dump full source bodies unnecessarily."""
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "id": "repo::Foo",
+                "name": "Foo",
+                "file_path": "Foo.java",
+                "repository": "repo",
+                "line_number": 1,
+                "line_end": 100,
+                "signature": "public class Foo",
+                "code": "public class Foo { /* 100 lines */ }",
+                "entity_type": "Class",
+                "language": "Java",
+                "return_type": None,
+                "modifiers": ["public"],
+                "stereotypes": [],
+                "content_hash": "h",
+                "properties": {},
+            },
+        ])
+
+        results = await graph_client.find_symbols("Foo")
+
+        assert len(results) == 1
+        assert results[0].code is None, \
+            f"default code_mode should be 'none'; got code={results[0].code!r}"
+
+    async def test_find_symbols_honors_code_mode_preview(self, graph_client):
+        """find_symbols(code_mode='preview') should return at most 10 lines
+        with a truncation marker. Neo4j's _apply_code_mode helper appends
+        '\\n... (truncated)' when the source has more than 10 lines. This
+        test is a direct regression guard against any future bypass of
+        _apply_code_mode in find_symbols (currently the preview branch is
+        only indirectly covered by search_code tests)."""
+        long_code = "\n".join(f"line{i}" for i in range(20))  # 20 lines
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "id": "repo::Foo",
+                "name": "Foo",
+                "file_path": "Foo.java",
+                "repository": "repo",
+                "line_number": 1,
+                "line_end": 20,
+                "signature": "public class Foo",
+                "code": long_code,
+                "entity_type": "Class",
+                "language": "Java",
+                "return_type": None,
+                "modifiers": ["public"],
+                "stereotypes": [],
+                "content_hash": "h",
+                "properties": {},
+            },
+        ])
+
+        results = await graph_client.find_symbols("Foo", code_mode="preview")
+
+        assert len(results) == 1
+        code = results[0].code
+        assert code is not None
+        assert "line0" in code
+        assert "line9" in code
+        assert "line10" not in code, \
+            f"Preview should drop line 10 and later; got: {code!r}"
+        assert "... (truncated)" in code, \
+            f"Preview should append truncation marker; got: {code!r}"
+
 
 class TestGetFileContext:
-    """Tests for GraphClient.get_file_context()."""
+    """Tests for Neo4jReadBackend.get_file_context()."""
+
+    async def test_get_file_context_reconstructs_nested_dotnet_namespace(self, graph_client):
+        """Neo4j parity with the Postgres fix: get_file_context.packages
+        must reconstruct full dotted names from pkg.id, not return raw
+        pkg.name. Same _full_name_from_id pattern as get_package_context
+        (neo4j.py:976).
+
+        After the Cypher change, `packages` in the main query result is
+        a list of {id, name} dicts instead of a list of strings.
+        """
+        graph_client._query = AsyncMock(side_effect=[
+            # 1. _resolve_file_target → single file row
+            [{
+                "name": "AuthService.cs",
+                "file_path": "src/AuthService.cs",
+                "repository": "repo",
+                "language": "csharp",
+            }],
+            # 2. Main get_file_context query result
+            [{
+                "name": "AuthService.cs",
+                "file_path": "src/AuthService.cs",
+                "repository": "repo",
+                "language": "csharp",
+                "content_hash": "h",
+                # New shape: list of dicts with id + name, from the
+                # `collect(DISTINCT {id: pkg.id, name: pkg.name})` change.
+                "packages": [
+                    {"id": "repo::Company.Product.Services", "name": "Services"},
+                ],
+                "classes": ["AuthService"],
+                "interfaces": [],
+                "top_level_methods": [],
+                "constructors": [],
+                "fields": [],
+                "references": [],
+                "exports": [],
+                "hooks": [],
+            }],
+        ])
+
+        result = await graph_client.get_file_context("AuthService.cs", repository="repo")
+
+        assert result is not None
+        assert result.packages == ["Company.Product.Services"], \
+            f"Expected full dotted namespace; got: {result.packages}"
 
     async def test_get_file_context_returns_file_details(self, graph_client):
         graph_client._query = AsyncMock(side_effect=[
@@ -1816,7 +2190,7 @@ class TestGetFileContext:
                 "repository": "repo",
                 "language": "TypeScript",
                 "content_hash": "deadbeef",
-                "packages": ["src.components"],
+                "packages": [{"id": "repo::src.components", "name": "src.components"}],
                 "classes": ["App"],
                 "interfaces": ["Props"],
                 "top_level_methods": ["renderApp"],
@@ -1873,7 +2247,7 @@ class TestGetFileContext:
                 "repository": "repo",
                 "language": "Java",
                 "content_hash": "cafebabe",
-                "packages": ["com.example"],
+                "packages": [{"id": "repo::com.example", "name": "com.example"}],
                 "classes": ["Service"],
                 "interfaces": [],
                 "top_level_methods": [],
@@ -1907,9 +2281,24 @@ class TestGetFileContext:
         with pytest.raises(ValueError, match="ambiguous"):
             await graph_client.get_file_context("config.py")
 
+    async def test_get_file_context_ambiguity_message_when_repo_provided(self, graph_client):
+        """Symmetric to the Postgres fix — Neo4j ambiguity message
+        must not suggest 'Provide repository=' when repo was provided."""
+        graph_client._query = AsyncMock(return_value=[
+            {"name": "tasks.py", "file_path": "src/a/tasks.py",
+             "repository": "repo", "language": "Python"},
+            {"name": "tasks.py", "file_path": "src/b/tasks.py",
+             "repository": "repo", "language": "Python"},
+        ])
+        with pytest.raises(ValueError) as excinfo:
+            await graph_client.get_file_context("tasks.py", repository="repo")
+        msg = str(excinfo.value)
+        assert "mbiguous" in msg
+        assert "Provide repository=" not in msg
+
 
 class TestGetHookUsage:
-    """Tests for GraphClient.get_hook_usage()."""
+    """Tests for Neo4jReadBackend.get_hook_usage()."""
 
     async def test_get_hook_usage_returns_callers(self, graph_client):
         graph_client._query = AsyncMock(return_value=[
@@ -1969,3 +2358,32 @@ class TestGetHookUsage:
         assert kwargs["query_limit"] == 3
         assert [result.name for result in results] == ["render1", "render2"]
         assert all(result.truncated is True for result in results)
+
+    async def test_get_hook_usage_returns_entity_id_for_chaining(self, graph_client):
+        """Backend parity with Postgres and with get_callers: hook-usage
+        results must carry entity_id so agents can chain to get_function_context
+        or get_callers without re-resolving by name."""
+        graph_client._query = AsyncMock(return_value=[
+            {
+                "entity_id": "repo::App.renderApp",
+                "name": "renderApp",
+                "file_path": "src/App.tsx",
+                "repository": "repo",
+                "signature": "function renderApp()",
+                "line_number": 42,
+                "entity_type": "Method",
+                "relationship_type": "USES_HOOK",
+            },
+        ])
+
+        results = await graph_client.get_hook_usage("useState")
+
+        assert len(results) == 1
+        assert results[0].entity_id == "repo::App.renderApp", (
+            f"CallGraphNode.entity_id must be populated for hook usage; got: {results[0].entity_id}"
+        )
+        # Defensive: the Cypher RETURN must expose m.id AS entity_id
+        cypher_arg = graph_client._query.call_args[0][0]
+        assert "m.id AS entity_id" in cypher_arg, (
+            f"get_hook_usage Cypher RETURN must expose m.id AS entity_id; got: {cypher_arg}"
+        )

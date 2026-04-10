@@ -1,4 +1,4 @@
-"""Neo4j graph client for querying Constellation's code knowledge graph."""
+"""Neo4j implementation of ReadBackend for querying Constellation's code knowledge graph."""
 
 import logging
 import re
@@ -7,8 +7,8 @@ from typing import Any
 from neo4j import AsyncGraphDatabase
 from openai import AsyncOpenAI
 
-from .config import get_config
-from .models import (
+from telescope.config import get_config
+from telescope.models import (
     CallGraphNode,
     ClassHierarchy,
     CodebaseOverview,
@@ -19,6 +19,7 @@ from .models import (
     PackageContext,
     RepositoryContext,
 )
+from telescope.backends.base import ReadBackend
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +72,8 @@ ENTITY_RESERVED_PROPERTIES = {
 }
 
 
-class GraphClient:
-    """Client for querying Constellation's code knowledge graph."""
+class Neo4jReadBackend(ReadBackend):
+    """Neo4j implementation of ReadBackend."""
 
     def __init__(self):
         self.config = get_config()
@@ -103,11 +104,11 @@ class GraphClient:
     def _normalize_value(value: Any) -> Any:
         """Convert Neo4j-specific scalar types into JSON-safe values."""
         if isinstance(value, dict):
-            return {k: GraphClient._normalize_value(v) for k, v in value.items()}
+            return {k: Neo4jReadBackend._normalize_value(v) for k, v in value.items()}
         if isinstance(value, list):
-            return [GraphClient._normalize_value(v) for v in value]
+            return [Neo4jReadBackend._normalize_value(v) for v in value]
         if isinstance(value, tuple):
-            return tuple(GraphClient._normalize_value(v) for v in value)
+            return tuple(Neo4jReadBackend._normalize_value(v) for v in value)
 
         iso_format = getattr(value, "iso_format", None)
         if callable(iso_format):
@@ -357,6 +358,7 @@ class GraphClient:
         method_name: str,
         repository: str | None = None,
         file_path: str | None = None,
+        entity_id: str | None = None,
     ) -> dict | None:
         """Resolve one method/constructor for exact-context queries."""
         match_clause, params = self._build_method_match(
@@ -364,6 +366,7 @@ class GraphClient:
             method_name=method_name,
             repository=repository,
             file_path=file_path,
+            entity_id=entity_id,
         )
         cypher = f"""
             {match_clause}
@@ -447,6 +450,37 @@ class GraphClient:
             properties=self._custom_entity_properties(record.get("properties")),
         )
 
+    @staticmethod
+    def _apply_code_mode(entities: list[CodeEntity], code_mode: str) -> None:
+        """Mutate entities to reflect the requested code_mode.
+
+        Mirrors the postgres.py:367-395 helper contract, but preserves
+        Neo4j's pre-existing preview behavior:
+
+        - "none": zero out the code field
+        - "signature": replace code with the signature
+        - "preview": if code is empty/None, fall back to signature;
+          otherwise keep the first 10 lines (splitting on "\\n") and
+          append "\\n... (truncated)" when the original has more than
+          10 lines
+        - anything else (e.g. "full"): leave code unchanged
+        """
+        if code_mode == "none":
+            for e in entities:
+                e.code = None
+        elif code_mode == "signature":
+            for e in entities:
+                e.code = e.signature
+        elif code_mode == "preview":
+            for e in entities:
+                if not e.code:
+                    e.code = e.signature
+                    continue
+                lines = e.code.split("\n")
+                if len(lines) <= 10:
+                    continue
+                e.code = "\n".join(lines[:10]) + "\n... (truncated)"
+
     def _method_family_fragment(self, alias: str) -> str:
         """Build a method-family expansion based on class/interface relationships."""
         return f"""
@@ -500,14 +534,23 @@ class GraphClient:
             return None
         if len(results) > 1:
             examples = ", ".join(r.get("file_path") or "?" for r in results)
+            if repository:
+                hint = (
+                    "Provide a longer path suffix or entity_id= to disambiguate"
+                )
+            else:
+                hint = (
+                    "Provide repository= or a longer path suffix to disambiguate"
+                )
             raise ValueError(
-                f"File '{file_path}' is ambiguous for the current filters. Matching entries: {examples}"
+                f"File '{file_path}' is ambiguous — matches: {examples}. {hint}."
             )
         return results[0]
 
     async def search_code(
         self,
         query: str,
+        *,
         limit: int = 10,
         entity_type: str | None = None,
         file_pattern: str | None = None,
@@ -547,25 +590,10 @@ class GraphClient:
         all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
         results = all_results[:limit]
 
-        def process_code(code: str | None, signature: str | None) -> str | None:
-            if code_mode == "none":
-                return None
-            if code_mode == "signature":
-                return signature
-            if code_mode == "preview":
-                if not code:
-                    return signature
-                lines = code.split("\n")
-                if len(lines) <= 10:
-                    return code
-                return "\n".join(lines[:10]) + "\n... (truncated)"
-            return code
-
-        entities: list[CodeEntity] = []
-        for record in results:
-            entity = self._entity_from_record(record)
-            entity.code = process_code(record.get("code"), record.get("signature"))
-            entities.append(entity)
+        entities: list[CodeEntity] = [
+            self._entity_from_record(record) for record in results
+        ]
+        self._apply_code_mode(entities, code_mode)
 
         if self._looks_like_symbol_query(query):
             symbol_results = await self.find_symbols(
@@ -577,6 +605,7 @@ class GraphClient:
                 exact=True,
                 language=language,
                 stereotype=stereotype,
+                code_mode=code_mode,
             )
             if not symbol_results:
                 symbol_results = await self.find_symbols(
@@ -588,12 +617,15 @@ class GraphClient:
                     exact=False,
                     language=language,
                     stereotype=stereotype,
+                    code_mode=code_mode,
                 )
+            # find_symbols(code_mode=code_mode) above has already applied the
+            # requested mode to symbol_results; no further transformation
+            # needed before merging.
 
             merged: list[CodeEntity] = []
             seen: set[tuple[str | None, str, str, str]] = set()
             for entity in symbol_results + entities:
-                entity.code = process_code(entity.code, entity.signature)
                 key = (
                     entity.entity_id,
                     entity.entity_type,
@@ -613,10 +645,11 @@ class GraphClient:
     async def get_callers(
         self,
         method_name: str,
+        *,
         repository: str | None = None,
         file_path: str | None = None,
-        depth: int = 1,
         entity_id: str | None = None,
+        depth: int = 1,
         limit: int = 50,
     ) -> list[CallGraphNode]:
         """Find callers of a method using the current Constellation graph schema."""
@@ -637,7 +670,8 @@ class GraphClient:
             MATCH path = (caller)-[:CALLS*1..{depth}]->(method)
             WHERE caller:Method OR caller:Constructor
             WITH caller, min(length(path)) AS depth
-            RETURN DISTINCT caller.name AS name, caller.file_path AS file_path,
+            RETURN DISTINCT caller.id AS entity_id,
+                   caller.name AS name, caller.file_path AS file_path,
                    caller.repository AS repository,
                    caller.signature AS signature, caller.line_number AS line_number,
                    head(labels(caller)) AS entity_type, 'CALLS' AS relationship_type,
@@ -655,6 +689,7 @@ class GraphClient:
                 name=r["name"],
                 file_path=r["file_path"] or "",
                 repository=r.get("repository"),
+                entity_id=r.get("entity_id"),
                 signature=r.get("signature"),
                 line_start=r.get("line_number"),
                 depth=r.get("depth", 1),
@@ -668,10 +703,11 @@ class GraphClient:
     async def get_callees(
         self,
         method_name: str,
+        *,
         repository: str | None = None,
         file_path: str | None = None,
-        depth: int = 1,
         entity_id: str | None = None,
+        depth: int = 1,
         limit: int = 50,
     ) -> list[CallGraphNode]:
         """Find call targets and hook usage for a method."""
@@ -692,7 +728,8 @@ class GraphClient:
             MATCH path = (method)-[:CALLS*1..{depth}]->(callee)
             WHERE callee:Method OR callee:Constructor OR callee:Reference
             WITH callee, min(length(path)) AS depth
-            RETURN DISTINCT callee.name AS name, callee.file_path AS file_path,
+            RETURN DISTINCT callee.id AS entity_id,
+                   callee.name AS name, callee.file_path AS file_path,
                    callee.repository AS repository,
                    callee.signature AS signature, callee.line_number AS line_number,
                    head(labels(callee)) AS entity_type, 'CALLS' AS relationship_type,
@@ -705,7 +742,8 @@ class GraphClient:
             {match_clause}
             {self._method_family_fragment("m")}
             MATCH (method)-[:USES_HOOK]->(hook:Hook)
-            RETURN DISTINCT hook.name AS name, hook.file_path AS file_path,
+            RETURN DISTINCT hook.id AS entity_id,
+                   hook.name AS name, hook.file_path AS file_path,
                    hook.repository AS repository,
                    hook.line_number AS line_number,
                    'Hook' AS entity_type, 'USES_HOOK' AS relationship_type,
@@ -743,6 +781,7 @@ class GraphClient:
                 name=r["name"],
                 file_path=r["file_path"] or "",
                 repository=r.get("repository"),
+                entity_id=r.get("entity_id"),
                 signature=r.get("signature"),
                 line_start=r.get("line_number"),
                 depth=r.get("depth", 1),
@@ -756,14 +795,17 @@ class GraphClient:
     async def get_function_context(
         self,
         method_name: str,
+        *,
         repository: str | None = None,
         file_path: str | None = None,
+        entity_id: str | None = None,
     ) -> FunctionContext | None:
         """Get full context for a function: code, callers, callees, class."""
         target = await self._resolve_method_target(
             method_name,
             repository=repository,
             file_path=file_path,
+            entity_id=entity_id,
         )
         if not target:
             return None
@@ -802,6 +844,7 @@ class GraphClient:
     async def get_class_hierarchy(
         self,
         class_name: str,
+        *,
         repository: str | None = None,
         file_path: str | None = None,
     ) -> ClassHierarchy | None:
@@ -917,6 +960,7 @@ class GraphClient:
     async def get_package_context(
         self,
         package_name: str,
+        *,
         repository: str | None = None,
     ) -> PackageContext | None:
         """Return package or namespace membership information."""
@@ -1026,7 +1070,7 @@ class GraphClient:
                 WITH files, languages, classes, interfaces, methods, constructors, count(field) AS fields
                 OPTIONAL MATCH (pkg:Package) {repo_filter_pkg}
                 WITH files, languages, classes, interfaces, methods, constructors, fields,
-                     count(pkg) AS packages_count, collect(DISTINCT pkg.name) AS packages
+                     count(pkg) AS packages_count, collect(DISTINCT {{id: pkg.id, name: pkg.name}}) AS packages
                 OPTIONAL MATCH (hook:Hook) {repo_filter_hook}
                 WITH files, languages, classes, interfaces, methods, constructors, fields,
                      packages_count, packages, count(hook) AS hooks
@@ -1077,6 +1121,7 @@ class GraphClient:
         top_classes_cypher = f"""
             MATCH (c:Class)
             {top_classes_filter} NOT (c)-[:EXTENDS]->(:Class)
+              AND NOT 'test' IN coalesce(c.stereotypes, [])
             OPTIONAL MATCH (child:Class)-[:EXTENDS*]->(c)
             WITH c, count(child) AS descendants
             ORDER BY descendants DESC
@@ -1090,6 +1135,7 @@ class GraphClient:
         entry_points_cypher = f"""
             MATCH (m:Method)
             {entry_filter} ('endpoint' IN m.stereotypes OR m.name = 'main')
+              AND NOT 'test' IN coalesce(m.stereotypes, [])
             OPTIONAL MATCH (c:Class)-[:HAS_METHOD]->(m)
             RETURN m.name AS name, c.name AS class_name
             LIMIT 10
@@ -1105,6 +1151,13 @@ class GraphClient:
 
         entry_points = [format_entry_point(entry) for entry in entry_results]
 
+        raw_packages = r.get("packages", []) or []
+        packages = [
+            self._full_name_from_id(pkg["id"], pkg["name"])
+            for pkg in raw_packages
+            if pkg and pkg.get("id")
+        ] if include_packages else []
+
         return CodebaseOverview(
             total_files=r.get("files", 0),
             total_classes=r.get("classes", 0),
@@ -1117,7 +1170,7 @@ class GraphClient:
             total_references=r.get("references", 0),
             total_exports=r.get("exports", 0),
             languages=[lang for lang in r.get("languages", []) if lang],
-            packages=[p for p in r.get("packages", []) if p] if include_packages else [],
+            packages=packages,
             top_level_classes=top_level_classes,
             entry_points=entry_points,
         )
@@ -1125,6 +1178,7 @@ class GraphClient:
     async def find_symbols(
         self,
         query: str,
+        *,
         entity_types: list[str] | None = None,
         repository: str | None = None,
         file_pattern: str | None = None,
@@ -1132,6 +1186,7 @@ class GraphClient:
         exact: bool = False,
         language: str | None = None,
         stereotype: str | None = None,
+        code_mode: str = "none",
     ) -> list[CodeEntity]:
         """Find graph entities by exact or substring symbol match."""
         limit = self._clamp_result_limit(limit, maximum=50)
@@ -1179,11 +1234,14 @@ class GraphClient:
             limit=limit,
             **filter_params,
         )
-        return [self._entity_from_record(row) for row in results]
+        entities = [self._entity_from_record(row) for row in results]
+        self._apply_code_mode(entities, code_mode)
+        return entities
 
     async def get_file_context(
         self,
         file_path: str,
+        *,
         repository: str | None = None,
     ) -> FileContext | None:
         """Get file-level graph context, including packages, exports, and hook usage."""
@@ -1195,7 +1253,7 @@ class GraphClient:
             MATCH (f:File {repository: $repository, file_path: $file_path})
             OPTIONAL MATCH (member)-[:IN_PACKAGE]->(pkg:Package)
             WHERE member.repository = f.repository AND member.file_path = f.file_path
-            WITH f, collect(DISTINCT pkg.name) AS packages
+            WITH f, collect(DISTINCT {id: pkg.id, name: pkg.name}) AS packages
             OPTIONAL MATCH (cls:Class)
             WHERE cls.repository = f.repository AND cls.file_path = f.file_path
             WITH f, packages, collect(DISTINCT cls.name) AS classes
@@ -1269,13 +1327,19 @@ class GraphClient:
             for export in row.get("exports", [])
             if export.get("name")
         ]
+        raw_packages = row.get("packages", []) or []
+        packages = [
+            self._full_name_from_id(pkg["id"], pkg["name"])
+            for pkg in raw_packages
+            if pkg and pkg.get("id")
+        ]
         return FileContext(
             name=row["name"],
             file_path=row["file_path"] or "",
             repository=row.get("repository"),
             language=row.get("language"),
             content_hash=row.get("content_hash"),
-            packages=[pkg for pkg in row.get("packages", []) if pkg],
+            packages=packages,
             exports=exports,
             classes=[name for name in row.get("classes", []) if name],
             interfaces=[name for name in row.get("interfaces", []) if name],
@@ -1289,6 +1353,7 @@ class GraphClient:
     async def get_hook_usage(
         self,
         hook_name: str,
+        *,
         repository: str | None = None,
         file_pattern: str | None = None,
         language: str | None = None,
@@ -1309,7 +1374,8 @@ class GraphClient:
             WHERE h.name = $hook_name
             MATCH (m)-[:USES_HOOK]->(h)
             WHERE (m:Method OR m:Constructor){filter_clause}
-            RETURN m.name AS name, m.file_path AS file_path,
+            RETURN m.id AS entity_id,
+                   m.name AS name, m.file_path AS file_path,
                    m.repository AS repository,
                    m.signature AS signature, m.line_number AS line_number,
                    head(labels(m)) AS entity_type, 'USES_HOOK' AS relationship_type
@@ -1324,6 +1390,7 @@ class GraphClient:
                 name=row["name"],
                 file_path=row["file_path"] or "",
                 repository=row.get("repository"),
+                entity_id=row.get("entity_id"),
                 signature=row.get("signature"),
                 line_start=row.get("line_number"),
                 entity_type=self._label_to_entity_type(row.get("entity_type")),
@@ -1336,8 +1403,10 @@ class GraphClient:
     async def get_impact(
         self,
         method_name: str,
+        *,
         repository: str | None = None,
         file_path: str | None = None,
+        entity_id: str | None = None,
         depth: int = 10,
         summary_only: bool = False,
         limit: int | None = None,
@@ -1347,6 +1416,7 @@ class GraphClient:
             method_name,
             repository=repository,
             file_path=file_path,
+            entity_id=entity_id,
         )
         if not target:
             return None
@@ -1358,7 +1428,8 @@ class GraphClient:
             MATCH path = (caller)-[:CALLS*1..{depth}]->(method)
             WHERE (caller:Method OR caller:Constructor) AND caller <> m AND caller <> method
             WITH caller, min(length(path)) AS depth
-            RETURN caller.name AS name, caller.file_path AS file_path,
+            RETURN caller.id AS entity_id,
+                   caller.name AS name, caller.file_path AS file_path,
                    caller.repository AS repository,
                    caller.signature AS signature, caller.line_number AS line_number,
                    caller.stereotypes AS stereotypes,
@@ -1393,6 +1464,7 @@ class GraphClient:
                 name=r["name"],
                 file_path=r["file_path"] or "",
                 repository=r.get("repository"),
+                entity_id=r.get("entity_id"),
                 signature=r.get("signature"),
                 line_start=r.get("line_number"),
                 depth=r.get("depth", 1),

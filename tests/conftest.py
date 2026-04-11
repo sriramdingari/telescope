@@ -75,30 +75,6 @@ def mock_neo4j_driver(mock_neo4j_session):
     return driver
 
 
-@pytest.fixture()
-def mock_openai_response():
-    """Create a mock OpenAI embedding response."""
-    def _make_response(embedding=None):
-        if embedding is None:
-            embedding = [0.1] * 1536
-        response = MagicMock()
-        data_item = MagicMock()
-        data_item.embedding = embedding
-        response.data = [data_item]
-        return response
-    return _make_response
-
-
-@pytest.fixture()
-def mock_openai_client(mock_openai_response):
-    """Create a mock AsyncOpenAI client."""
-    client = AsyncMock()
-    client.embeddings = AsyncMock()
-    client.embeddings.create = AsyncMock(return_value=mock_openai_response())
-    client.close = AsyncMock()
-    return client
-
-
 def _require_integration() -> None:
     """Skip integration fixtures unless explicitly enabled."""
     if os.environ.get("TELESCOPE_RUN_INTEGRATION") != "1":
@@ -358,14 +334,25 @@ async def live_neo4j_driver():
 async def live_graph_client():
     """Create a real Telescope Neo4jReadBackend against the local Neo4j instance."""
     _require_integration()
-    with patch("telescope.backends.neo4j.get_config", return_value=_neo4j_config()), \
-         patch("telescope.backends.neo4j.AsyncOpenAI") as mock_openai:
-        mock_client = AsyncMock()
-        mock_client.close = AsyncMock()
-        mock_openai.return_value = mock_client
+
+    from telescope.embeddings.base import BaseEmbeddingProvider
+
+    class _StubEmbedder(BaseEmbeddingProvider):
+        @property
+        def model_name(self) -> str:
+            return "stub"
+
+        @property
+        def dimensions(self) -> int:
+            return 1536
+
+        async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+            return [[0.0] * 1536 for _ in texts]
+
+    with patch("telescope.backends.neo4j.get_config", return_value=_neo4j_config()):
         from telescope.backends.neo4j import Neo4jReadBackend
 
-        client = Neo4jReadBackend()
+        client = Neo4jReadBackend(embedder=_StubEmbedder())
         await client.connect()
         try:
             yield client

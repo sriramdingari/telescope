@@ -7,9 +7,9 @@ import logging
 from typing import Any
 
 import asyncpg
-from openai import AsyncOpenAI
 
 from telescope.backends.base import ReadBackend
+from telescope.embeddings.base import BaseEmbeddingProvider
 from telescope.models import (
     CallGraphNode, ClassHierarchy, CodebaseOverview, CodeEntity,
     FileContext, FunctionContext, ImpactResult, PackageContext, RepositoryContext,
@@ -24,19 +24,12 @@ class PostgresReadBackend(ReadBackend):
     def __init__(
         self,
         dsn: str,
-        openai_api_key: str,
-        openai_base_url: str | None = None,
-        embedding_model: str = "text-embedding-3-small",
-        embedding_dimensions: int = 1536,
+        *,
+        embedder: BaseEmbeddingProvider,
     ) -> None:
         self._dsn = dsn
         self._pool: asyncpg.Pool | None = None
-        self._embedding_model = embedding_model
-        self._embedding_dimensions = embedding_dimensions
-        self._openai = AsyncOpenAI(
-            api_key=openai_api_key,
-            base_url=openai_base_url or None,
-        )
+        self._embedder = embedder
 
     async def connect(self) -> None:
         from pgvector.asyncpg import register_vector
@@ -75,12 +68,8 @@ class PostgresReadBackend(ReadBackend):
     # ── Private helpers ──────────────────────────────────────────────────
 
     async def _get_embedding(self, text: str) -> list[float]:
-        response = await self._openai.embeddings.create(
-            model=self._embedding_model,
-            input=text,
-            dimensions=self._embedding_dimensions,
-        )
-        return response.data[0].embedding
+        vectors = await self._embedder.embed_batch([text])
+        return vectors[0]
 
     async def _resolve_symbol(
         self,

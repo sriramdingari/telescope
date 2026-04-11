@@ -7,6 +7,7 @@ from dataclasses import dataclass
 @dataclass
 class Config:
     """Server configuration loaded from environment variables."""
+
     neo4j_uri: str
     neo4j_user: str
     neo4j_password: str
@@ -16,6 +17,14 @@ class Config:
     embedding_dimensions: int = 1536
     storage_backend: str = "neo4j"
     postgres_dsn: str = ""
+    # Embedding provider selection -----------------------------------
+    # ``embedding_provider`` defaults to "openai" so existing deployments
+    # that set only OPENAI_* env vars keep working. Setting it to
+    # "ollama" activates the Ollama-specific settings below.
+    embedding_provider: str = "openai"
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_embedding_model: str = "nomic-embed-text"
+    ollama_embedding_dimensions: int = 768
 
     def __post_init__(self) -> None:
         """Validate that postgres_dsn is set when storage_backend is postgres.
@@ -28,6 +37,22 @@ class Config:
                 "storage_backend='postgres' requires postgres_dsn to be set. "
                 "Example: postgresql://user:pass@host:5432/dbname"
             )
+
+    def resolved_embedding_model(self) -> str:
+        """Return the model name for the active ``embedding_provider``."""
+        if self.embedding_provider == "openai":
+            return self.embedding_model
+        if self.embedding_provider == "ollama":
+            return self.ollama_embedding_model
+        raise ValueError(f"Unknown embedding provider: {self.embedding_provider!r}")
+
+    def resolved_embedding_dimensions(self) -> int:
+        """Return the vector length for the active ``embedding_provider``."""
+        if self.embedding_provider == "openai":
+            return self.embedding_dimensions
+        if self.embedding_provider == "ollama":
+            return self.ollama_embedding_dimensions
+        raise ValueError(f"Unknown embedding provider: {self.embedding_provider!r}")
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -42,6 +67,16 @@ class Config:
             embedding_dimensions=int(os.environ.get("EMBEDDING_DIMENSIONS", "1536")),
             storage_backend=os.environ.get("STORAGE_BACKEND", "neo4j"),
             postgres_dsn=os.environ.get("POSTGRES_DSN", ""),
+            embedding_provider=os.environ.get("EMBEDDING_PROVIDER", "openai"),
+            ollama_base_url=os.environ.get(
+                "OLLAMA_BASE_URL", "http://localhost:11434"
+            ),
+            ollama_embedding_model=os.environ.get(
+                "OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"
+            ),
+            ollama_embedding_dimensions=int(
+                os.environ.get("OLLAMA_EMBEDDING_DIMENSIONS", "768")
+            ),
         )
 
 

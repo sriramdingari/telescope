@@ -186,3 +186,99 @@ def test_config_neo4j_backend_does_not_require_postgres_dsn():
         postgres_dsn="",
     )
     assert c.storage_backend == "neo4j"
+
+
+class TestConfigEmbeddingProviderDefaults:
+    """Tests for embedding-provider-related config defaults."""
+
+    def test_default_embedding_provider_is_openai(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = Config.from_env()
+        assert cfg.embedding_provider == "openai"
+
+    def test_default_ollama_base_url(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = Config.from_env()
+        assert cfg.ollama_base_url == "http://localhost:11434"
+
+    def test_default_ollama_embedding_model(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = Config.from_env()
+        assert cfg.ollama_embedding_model == "nomic-embed-text"
+
+    def test_default_ollama_embedding_dimensions(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = Config.from_env()
+        assert cfg.ollama_embedding_dimensions == 768
+
+
+class TestConfigEmbeddingProviderEnvOverrides:
+    def test_embedding_provider_override(self):
+        with patch.dict(os.environ, {"EMBEDDING_PROVIDER": "ollama"}, clear=True):
+            cfg = Config.from_env()
+        assert cfg.embedding_provider == "ollama"
+
+    def test_ollama_base_url_override(self):
+        with patch.dict(
+            os.environ, {"OLLAMA_BASE_URL": "http://host.docker.internal:11434"}, clear=True
+        ):
+            cfg = Config.from_env()
+        assert cfg.ollama_base_url == "http://host.docker.internal:11434"
+
+    def test_ollama_embedding_model_override(self):
+        with patch.dict(
+            os.environ, {"OLLAMA_EMBEDDING_MODEL": "mxbai-embed-large"}, clear=True
+        ):
+            cfg = Config.from_env()
+        assert cfg.ollama_embedding_model == "mxbai-embed-large"
+
+    def test_ollama_embedding_dimensions_override(self):
+        with patch.dict(
+            os.environ, {"OLLAMA_EMBEDDING_DIMENSIONS": "1024"}, clear=True
+        ):
+            cfg = Config.from_env()
+        assert cfg.ollama_embedding_dimensions == 1024
+        assert isinstance(cfg.ollama_embedding_dimensions, int)
+
+
+class TestResolvedEmbeddingHelpers:
+    def _cfg(self, **kw):
+        return Config(
+            neo4j_uri="bolt://localhost:7687",
+            neo4j_user="neo4j",
+            neo4j_password="pw",
+            openai_api_key="sk-test",
+            **kw,
+        )
+
+    def test_resolved_openai_model(self):
+        cfg = self._cfg(embedding_provider="openai", embedding_model="text-embedding-3-large")
+        assert cfg.resolved_embedding_model() == "text-embedding-3-large"
+
+    def test_resolved_openai_dimensions(self):
+        cfg = self._cfg(embedding_provider="openai", embedding_dimensions=3072)
+        assert cfg.resolved_embedding_dimensions() == 3072
+
+    def test_resolved_ollama_model(self):
+        cfg = self._cfg(
+            embedding_provider="ollama",
+            ollama_embedding_model="mxbai-embed-large",
+        )
+        assert cfg.resolved_embedding_model() == "mxbai-embed-large"
+
+    def test_resolved_ollama_dimensions(self):
+        cfg = self._cfg(
+            embedding_provider="ollama",
+            ollama_embedding_dimensions=1024,
+        )
+        assert cfg.resolved_embedding_dimensions() == 1024
+
+    def test_resolved_model_rejects_unknown_provider(self):
+        cfg = self._cfg(embedding_provider="bogus")
+        with pytest.raises(ValueError, match="Unknown embedding provider"):
+            cfg.resolved_embedding_model()
+
+    def test_resolved_dimensions_rejects_unknown_provider(self):
+        cfg = self._cfg(embedding_provider="bogus")
+        with pytest.raises(ValueError, match="Unknown embedding provider"):
+            cfg.resolved_embedding_dimensions()

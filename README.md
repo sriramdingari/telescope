@@ -104,6 +104,25 @@ claude mcp add-json telescope --scope user '{
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model name |
 | `EMBEDDING_DIMENSIONS` | `1536` | Vector dimensions |
 
+### Ollama embedding provider (optional)
+
+Telescope defaults to OpenAI for query-side embeddings. To use a local Ollama
+server instead — typically when the corresponding Constellation indexing run
+also used Ollama — set:
+
+| Variable | Default | Description |
+|---|---|---|
+| `EMBEDDING_PROVIDER` | `openai` | Set to `ollama` to enable the Ollama path |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server endpoint |
+| `OLLAMA_EMBEDDING_MODEL` | `nomic-embed-text` | Must match Constellation's indexing model |
+| `OLLAMA_EMBEDDING_DIMENSIONS` | `768` | Must match the model's native dim (and Constellation's setting) |
+
+**Critical:** the embedding model, provider, and dimensions MUST be identical
+on the indexing side (Constellation) and the query side (telescope). If they
+diverge you get either a hard pgvector dimension error or silently broken
+search results (vectors from different models live in different semantic
+spaces).
+
 ## Tools
 
 Telescope exposes 13 tools via the MCP protocol:

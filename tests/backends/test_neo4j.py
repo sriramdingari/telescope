@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from telescope.config import Config
+from telescope.embeddings.base import BaseEmbeddingProvider
 from telescope.models import (
     CallGraphNode,
     ClassHierarchy,
@@ -16,6 +17,24 @@ from telescope.models import (
     PackageContext,
     RepositoryContext,
 )
+
+
+class _StubEmbedder(BaseEmbeddingProvider):
+    def __init__(self, dimensions: int = 1536) -> None:
+        self._dimensions = dimensions
+        self.calls: list[list[str]] = []
+
+    @property
+    def model_name(self) -> str:
+        return "stub"
+
+    @property
+    def dimensions(self) -> int:
+        return self._dimensions
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(list(texts))
+        return [[0.0] * self._dimensions for _ in texts]
 
 
 @pytest.fixture()
@@ -40,13 +59,12 @@ class TestNeo4jReadBackendConnect:
 
     async def test_connect_creates_driver(self, patched_config):
         """Verify AsyncGraphDatabase.driver is called with correct URI and auth."""
-        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.backends.neo4j.AsyncOpenAI"):
+        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb:
             mock_driver = AsyncMock()
             mock_driver.verify_connectivity = AsyncMock()
             mock_gdb.driver = MagicMock(return_value=mock_driver)
             from telescope.backends.neo4j import Neo4jReadBackend
-            client = Neo4jReadBackend()
+            client = Neo4jReadBackend(embedder=_StubEmbedder())
             await client.connect()
             mock_gdb.driver.assert_called_once_with(
                 "bolt://localhost:7687",
@@ -55,55 +73,13 @@ class TestNeo4jReadBackendConnect:
 
     async def test_connect_verifies_connectivity(self, patched_config, mock_neo4j_driver):
         """Startup should fail fast if Neo4j connectivity is broken."""
-        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.backends.neo4j.AsyncOpenAI"):
+        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb:
             mock_gdb.driver = MagicMock(return_value=mock_neo4j_driver)
             from telescope.backends.neo4j import Neo4jReadBackend
-            client = Neo4jReadBackend()
+            client = Neo4jReadBackend(embedder=_StubEmbedder())
             await client.connect()
             mock_neo4j_driver.verify_connectivity.assert_awaited_once()
 
-    async def test_connect_creates_openai_client(self, patched_config):
-        """Verify AsyncOpenAI is called with api_key."""
-        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.backends.neo4j.AsyncOpenAI") as mock_openai:
-            mock_driver = AsyncMock()
-            mock_driver.verify_connectivity = AsyncMock()
-            mock_gdb.driver = MagicMock(return_value=mock_driver)
-            from telescope.backends.neo4j import Neo4jReadBackend
-            client = Neo4jReadBackend()
-            await client.connect()
-            call_kwargs = mock_openai.call_args[1]
-            assert call_kwargs["api_key"] == "sk-test-key"
-
-    async def test_connect_passes_base_url_when_set(self, test_config):
-        """When openai_base_url is set, AsyncOpenAI is called with base_url."""
-        test_config.openai_base_url = "https://my-custom-openai.example.com"
-        with patch("telescope.backends.neo4j.get_config", return_value=test_config), \
-             patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.backends.neo4j.AsyncOpenAI") as mock_openai:
-            mock_driver = AsyncMock()
-            mock_driver.verify_connectivity = AsyncMock()
-            mock_gdb.driver = MagicMock(return_value=mock_driver)
-            from telescope.backends.neo4j import Neo4jReadBackend
-            client = Neo4jReadBackend()
-            await client.connect()
-            call_kwargs = mock_openai.call_args[1]
-            assert call_kwargs.get("base_url") == "https://my-custom-openai.example.com"
-
-    async def test_connect_omits_base_url_when_none(self, patched_config):
-        """When openai_base_url is None, AsyncOpenAI is NOT called with base_url."""
-        assert patched_config.openai_base_url is None
-        with patch("telescope.backends.neo4j.AsyncGraphDatabase") as mock_gdb, \
-             patch("telescope.backends.neo4j.AsyncOpenAI") as mock_openai:
-            mock_driver = AsyncMock()
-            mock_driver.verify_connectivity = AsyncMock()
-            mock_gdb.driver = MagicMock(return_value=mock_driver)
-            from telescope.backends.neo4j import Neo4jReadBackend
-            client = Neo4jReadBackend()
-            await client.connect()
-            call_kwargs = mock_openai.call_args[1]
-            assert "base_url" not in call_kwargs
 
 
 class TestNeo4jReadBackendClose:
@@ -112,23 +88,15 @@ class TestNeo4jReadBackendClose:
     async def test_close_calls_driver_close(self, patched_config, mock_neo4j_driver):
         """Verify driver.close() is called when driver exists."""
         from telescope.backends.neo4j import Neo4jReadBackend
-        client = Neo4jReadBackend()
+        client = Neo4jReadBackend(embedder=_StubEmbedder())
         client._driver = mock_neo4j_driver
         await client.close()
         mock_neo4j_driver.close.assert_called_once()
 
-    async def test_close_calls_openai_close(self, patched_config, mock_openai_client):
-        """Verify the OpenAI client is closed when present."""
-        from telescope.backends.neo4j import Neo4jReadBackend
-        client = Neo4jReadBackend()
-        client._openai = mock_openai_client
-        await client.close()
-        mock_openai_client.close.assert_awaited_once()
-
     async def test_close_safe_when_not_connected(self, patched_config):
         """No error when _driver is None (never connected)."""
         from telescope.backends.neo4j import Neo4jReadBackend
-        client = Neo4jReadBackend()
+        client = Neo4jReadBackend(embedder=_StubEmbedder())
         assert client._driver is None
         # Should not raise
         await client.close()
@@ -146,7 +114,7 @@ class TestNeo4jReadBackendQuery:
             return_value=mock_neo4j_result(expected_data)
         )
         from telescope.backends.neo4j import Neo4jReadBackend
-        client = Neo4jReadBackend()
+        client = Neo4jReadBackend(embedder=_StubEmbedder())
         client._driver = mock_neo4j_driver
         result = await client._query("MATCH (n) RETURN n")
         assert result == expected_data
@@ -159,7 +127,7 @@ class TestNeo4jReadBackendQuery:
         mock_result = mock_neo4j_result([{"name": "foo"}])
         mock_session.run = AsyncMock(return_value=mock_result)
         from telescope.backends.neo4j import Neo4jReadBackend
-        client = Neo4jReadBackend()
+        client = Neo4jReadBackend(embedder=_StubEmbedder())
         client._driver = mock_neo4j_driver
         await client._query("MATCH (n) RETURN n")
         mock_result.data.assert_awaited_once()
@@ -172,44 +140,12 @@ class TestNeo4jReadBackendQuery:
         mock_session = mock_neo4j_driver.session.return_value
         mock_session.run = AsyncMock(return_value=mock_neo4j_result([]))
         from telescope.backends.neo4j import Neo4jReadBackend
-        client = Neo4jReadBackend()
+        client = Neo4jReadBackend(embedder=_StubEmbedder())
         client._driver = mock_neo4j_driver
         await client._query("MATCH (n {name: $name}) RETURN n", name="MyClass")
         mock_session.run.assert_called_once_with(
             "MATCH (n {name: $name}) RETURN n", name="MyClass"
         )
-
-
-class TestNeo4jReadBackendGetEmbedding:
-    """Tests for Neo4jReadBackend._get_embedding()."""
-
-    async def test_get_embedding_calls_openai(
-        self, patched_config, mock_openai_client
-    ):
-        """Verify embeddings.create() is called with correct model, input, dimensions."""
-        from telescope.backends.neo4j import Neo4jReadBackend
-        client = Neo4jReadBackend()
-        client._openai = mock_openai_client
-        await client._get_embedding("search query text")
-        mock_openai_client.embeddings.create.assert_called_once_with(
-            model=patched_config.embedding_model,
-            input="search query text",
-            dimensions=patched_config.embedding_dimensions,
-        )
-
-    async def test_get_embedding_returns_vector(
-        self, patched_config, mock_openai_client, mock_openai_response
-    ):
-        """Verify _get_embedding returns the embedding list from the response."""
-        expected_vector = [0.5] * 1536
-        mock_openai_client.embeddings.create = AsyncMock(
-            return_value=mock_openai_response(embedding=expected_vector)
-        )
-        from telescope.backends.neo4j import Neo4jReadBackend
-        client = Neo4jReadBackend()
-        client._openai = mock_openai_client
-        result = await client._get_embedding("some text")
-        assert result == expected_vector
 
 
 def _make_search_result(
@@ -256,9 +192,8 @@ def graph_client(test_config):
     """Create a Neo4jReadBackend with mocked internals for search_code tests."""
     with patch("telescope.backends.neo4j.get_config", return_value=test_config):
         from telescope.backends.neo4j import Neo4jReadBackend
-        client = Neo4jReadBackend()
+        client = Neo4jReadBackend(embedder=_StubEmbedder())
     client._driver = AsyncMock()
-    client._openai = AsyncMock()
     return client
 
 
@@ -2387,3 +2322,16 @@ class TestGetHookUsage:
         assert "m.id AS entity_id" in cypher_arg, (
             f"get_hook_usage Cypher RETURN must expose m.id AS entity_id; got: {cypher_arg}"
         )
+
+
+class TestNeo4jEmbeddingDelegation:
+    @pytest.mark.asyncio
+    async def test_get_embedding_delegates_to_provider(self, patched_config):
+        embedder = _StubEmbedder()
+        from telescope.backends.neo4j import Neo4jReadBackend
+
+        backend = Neo4jReadBackend(embedder=embedder)
+        vec = await backend._get_embedding("any query")
+
+        assert vec == [0.0] * embedder.dimensions
+        assert embedder.calls == [["any query"]]

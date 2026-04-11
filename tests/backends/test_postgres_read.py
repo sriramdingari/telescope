@@ -4,6 +4,27 @@ from unittest.mock import AsyncMock, MagicMock
 
 from telescope.backends.postgres import PostgresReadBackend
 from telescope.backends.base import ReadBackend
+from telescope.embeddings.base import BaseEmbeddingProvider
+
+
+class _StubEmbedder(BaseEmbeddingProvider):
+    """Minimal deterministic embedder used by the postgres backend fixture."""
+
+    def __init__(self, dimensions: int = 1536) -> None:
+        self._dimensions = dimensions
+        self.calls: list[list[str]] = []
+
+    @property
+    def model_name(self) -> str:
+        return "stub"
+
+    @property
+    def dimensions(self) -> int:
+        return self._dimensions
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(list(texts))
+        return [[0.0] * self._dimensions for _ in texts]
 
 
 @pytest.fixture
@@ -16,10 +37,15 @@ def mock_pool():
 
 
 @pytest.fixture
-def backend(mock_pool):
+def stub_embedder():
+    return _StubEmbedder()
+
+
+@pytest.fixture
+def backend(mock_pool, stub_embedder):
     b = PostgresReadBackend(
         dsn="postgresql://test:test@localhost/test",
-        openai_api_key="test-key",
+        embedder=stub_embedder,
     )
     b._pool = mock_pool
     return b
@@ -1956,7 +1982,7 @@ async def test_connect_registers_jsonb_codec_alongside_pgvector(monkeypatch):
 
     backend = PostgresReadBackend(
         dsn="postgresql://test:test@localhost/test",
-        openai_api_key="sk-test-key",
+        embedder=_StubEmbedder(),
     )
     await backend.connect()
 
@@ -2196,3 +2222,11 @@ async def test_seeded_postgres_fixture_uses_relative_file_paths(
         f"{len(rows)} rows with absolute paths. Examples: "
         f"{[(r['id'], r['file_path']) for r in rows[:3]]}"
     )
+
+
+class TestPostgresEmbeddingDelegation:
+    @pytest.mark.asyncio
+    async def test_get_embedding_delegates_to_provider(self, backend, stub_embedder):
+        vec = await backend._get_embedding("find login handler")
+        assert vec == [0.0] * stub_embedder.dimensions
+        assert stub_embedder.calls == [["find login handler"]]

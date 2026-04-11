@@ -5,9 +5,9 @@ import re
 from typing import Any
 
 from neo4j import AsyncGraphDatabase
-from openai import AsyncOpenAI
 
 from telescope.config import get_config
+from telescope.embeddings.base import BaseEmbeddingProvider
 from telescope.models import (
     CallGraphNode,
     ClassHierarchy,
@@ -75,30 +75,24 @@ ENTITY_RESERVED_PROPERTIES = {
 class Neo4jReadBackend(ReadBackend):
     """Neo4j implementation of ReadBackend."""
 
-    def __init__(self):
+    def __init__(self, *, embedder: BaseEmbeddingProvider) -> None:
         self.config = get_config()
         self._driver = None
-        self._openai = None
+        self._embedder = embedder
 
     async def connect(self):
-        """Connect to Neo4j and initialize OpenAI client."""
+        """Connect to Neo4j."""
         self._driver = AsyncGraphDatabase.driver(
             self.config.neo4j_uri,
             auth=(self.config.neo4j_user, self.config.neo4j_password),
         )
         await self._driver.verify_connectivity()
-        kwargs = {"api_key": self.config.openai_api_key}
-        if self.config.openai_base_url:
-            kwargs["base_url"] = self.config.openai_base_url
-        self._openai = AsyncOpenAI(**kwargs)
         logger.info(f"Connected to Neo4j at {self.config.neo4j_uri}")
 
     async def close(self):
         """Close the Neo4j driver."""
         if self._driver:
             await self._driver.close()
-        if self._openai and hasattr(self._openai, "close"):
-            await self._openai.close()
 
     @staticmethod
     def _normalize_value(value: Any) -> Any:
@@ -132,12 +126,8 @@ class Neo4jReadBackend(ReadBackend):
 
     async def _get_embedding(self, text: str) -> list[float]:
         """Generate an embedding vector for the given text."""
-        response = await self._openai.embeddings.create(
-            model=self.config.embedding_model,
-            input=text,
-            dimensions=self.config.embedding_dimensions,
-        )
-        return response.data[0].embedding
+        vectors = await self._embedder.embed_batch([text])
+        return vectors[0]
 
     @staticmethod
     def _file_pattern_to_regex(file_pattern: str) -> str:

@@ -13,6 +13,7 @@ import pytest
 import pytest_asyncio
 
 from telescope.backends.postgres import PostgresReadBackend
+from telescope.embeddings.base import BaseEmbeddingProvider
 
 # Skip the module entirely if testcontainers isn't installed
 _skip_reason: str | None = None
@@ -26,19 +27,33 @@ if _skip_reason:
     pytestmark.append(pytest.mark.skip(reason=_skip_reason))
 
 
+class _StubEmbedder(BaseEmbeddingProvider):
+    """Stub embedder for contract tests — semantic search is covered in
+    the unit tests; these contract tests exercise the graph read path."""
+
+    @property
+    def model_name(self) -> str:
+        return "stub"
+
+    @property
+    def dimensions(self) -> int:
+        return 1536
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [[0.0] * 1536 for _ in texts]
+
+
 @pytest_asyncio.fixture
 async def pg_read_backend(postgres_dsn):
     """Telescope's PostgresReadBackend connected to the session container.
 
-    Uses a dummy OpenAI key because contract tests exercise the graph
+    Uses a stub embedder because contract tests exercise the graph
     read path directly; semantic search is covered by the mocked unit
     tests in tests/backends/test_postgres_read.py.
     """
     backend = PostgresReadBackend(
         dsn=postgres_dsn,
-        openai_api_key="sk-test-contract-key",
-        embedding_model="text-embedding-3-small",
-        embedding_dimensions=1536,
+        embedder=_StubEmbedder(),
     )
     await backend.connect()
     yield backend
